@@ -1,0 +1,8 @@
+.git
+.gitignore
+.gcloudignore
+target/
+spring-debug.log*
+.env
+GenerateHash.class
+output.json
