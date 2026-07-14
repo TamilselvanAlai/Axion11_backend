@@ -5,6 +5,7 @@ import com.axion11.visualops.models.Team;
 import com.axion11.visualops.models.User;
 import com.axion11.visualops.repository.TeamRepository;
 import com.axion11.visualops.repository.UserRepository;
+import com.axion11.visualops.service.InvitationEmailService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
@@ -24,6 +25,9 @@ public class TeamController {
     private final TeamRepository teamRepository;
     private final UserRepository userRepository;
     private final PasswordEncoder passwordEncoder;
+    private final InvitationEmailService invitationEmailService;
+
+    private static final java.time.Duration INVITE_TOKEN_TTL = java.time.Duration.ofHours(48);
 
     // ── GET /api/teams ────────────────────────────────────────────────────────
 
@@ -186,26 +190,51 @@ public class TeamController {
         String roleStr = body.get("role");
         String contact = body.get("contact");
         String country = body.get("country");
+        String email = body.get("email");
 
         Set<Team> teamsToAssign = parseTeamNames(teamNameStr);
 
-        String baseEmail = name.toLowerCase().replaceAll("\\s+", "");
-        String generatedEmail = baseEmail;
-        int suffix = 2;
-        while (userRepository.existsByEmail(generatedEmail)) {
-            generatedEmail = baseEmail + suffix++;
-        }
+        User user;
+        if (email != null && !email.isBlank()) {
+            if (userRepository.existsByEmail(email)) {
+                return ResponseEntity.badRequest().body(Map.of("error", "Email already in use"));
+            }
 
-        User user = User.builder()
-                .email(generatedEmail)
-                .name(name)
-                .password(passwordEncoder.encode("test1234"))
-                .role(mapRole(roleStr))
-                .teams(teamsToAssign)
-                .country(country)
-                .contactNumber(contact)
-                .build();
-        user = userRepository.save(user);
+            String inviteToken = UUID.randomUUID().toString();
+            user = User.builder()
+                    .email(email)
+                    .name(name)
+                    // Random unguessable placeholder — replaced when the invitee sets their own
+                    // password via the /set-password activation flow; never used to log in directly.
+                    .password(passwordEncoder.encode("invite-" + UUID.randomUUID()))
+                    .role(mapRole(roleStr))
+                    .teams(teamsToAssign)
+                    .country(country)
+                    .contactNumber(contact)
+                    .inviteToken(inviteToken)
+                    .inviteTokenExpiry(java.time.Instant.now().plus(INVITE_TOKEN_TTL))
+                    .build();
+            user = userRepository.save(user);
+            invitationEmailService.sendInviteEmail(user, inviteToken);
+        } else {
+            String baseEmail = name.toLowerCase().replaceAll("\\s+", "");
+            String generatedEmail = baseEmail;
+            int suffix = 2;
+            while (userRepository.existsByEmail(generatedEmail)) {
+                generatedEmail = baseEmail + suffix++;
+            }
+
+            user = User.builder()
+                    .email(generatedEmail)
+                    .name(name)
+                    .password(passwordEncoder.encode("test1234"))
+                    .role(mapRole(roleStr))
+                    .teams(teamsToAssign)
+                    .country(country)
+                    .contactNumber(contact)
+                    .build();
+            user = userRepository.save(user);
+        }
 
         String teamNames = user.getTeams().stream()
                 .map(Team::getTeamName).collect(Collectors.joining(", "));
@@ -314,6 +343,26 @@ public class TeamController {
         result.put("country", user.getCountry());
         result.put("teamName", teamNames);
         return ResponseEntity.ok(result);
+    }
+
+    // ── POST /api/teams/members/{id}/resend-invite ───────────────────────────
+
+    @PostMapping("/teams/members/{id}/resend-invite")
+    @PreAuthorize("hasAnyRole('SUPER_ADMIN', 'ADMIN')")
+    public ResponseEntity<Map<String, Object>> resendInvite(@PathVariable("id") Long id) {
+        User user = userRepository.findById(id).orElse(null);
+        if (user == null) return ResponseEntity.notFound().build();
+        if (user.getInviteToken() == null) {
+            return ResponseEntity.badRequest().body(Map.of("error", "This user has already activated their account"));
+        }
+
+        String inviteToken = UUID.randomUUID().toString();
+        user.setInviteToken(inviteToken);
+        user.setInviteTokenExpiry(java.time.Instant.now().plus(INVITE_TOKEN_TTL));
+        userRepository.save(user);
+        invitationEmailService.sendInviteEmail(user, inviteToken);
+
+        return ResponseEntity.ok(Map.of("message", "Invitation resent"));
     }
 
     // ── DELETE /api/teams/members/{id} ────────────────────────────────────────

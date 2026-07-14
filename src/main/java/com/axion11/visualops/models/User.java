@@ -53,6 +53,13 @@ public class User implements UserDetails {
     @Column(length = 30)
     private String contactNumber;
 
+    /** Non-null while an invited user hasn't set their own password yet; cleared on activation. */
+    @Column(unique = true)
+    private String inviteToken;
+
+    @Column
+    private java.time.Instant inviteTokenExpiry;
+
     @Override
     public Collection<? extends GrantedAuthority> getAuthorities() {
         return List.of(new SimpleGrantedAuthority("ROLE_" + role.name()));

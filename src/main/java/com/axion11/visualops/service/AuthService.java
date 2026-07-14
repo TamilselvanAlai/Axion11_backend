@@ -44,6 +44,12 @@ public class AuthService {
     }
 
     public AuthResponseDto login(LoginDto loginDto) {
+        userRepository.findByEmail(loginDto.getEmail()).ifPresent(pending -> {
+            if (pending.getInviteToken() != null) {
+                throw new AccountNotActivatedException();
+            }
+        });
+
         Authentication authentication = authenticationManager.authenticate(
                 new UsernamePasswordAuthenticationToken(loginDto.getEmail(), loginDto.getPassword()));
 
@@ -57,6 +63,33 @@ public class AuthService {
         String teamName = user.getTeams().stream()
                 .findFirst().map(t -> t.getTeamName()).orElse(null);
         return new AuthResponseDto(token, user.getEmail(), user.getName(), user.getRole().name(), teamName);
+    }
+
+    @Transactional
+    public AuthResponseDto activateAccount(String inviteToken, String newPassword) {
+        User user = userRepository.findByInviteToken(inviteToken)
+                .orElseThrow(() -> new RuntimeException("Invalid or already-used invitation link"));
+
+        if (user.getInviteTokenExpiry() == null || user.getInviteTokenExpiry().isBefore(java.time.Instant.now())) {
+            throw new RuntimeException("This invitation link has expired. Ask an admin to resend it.");
+        }
+
+        user.setPassword(passwordEncoder.encode(newPassword));
+        user.setInviteToken(null);
+        user.setInviteTokenExpiry(null);
+        userRepository.save(user);
+
+        String token = jwtTokenProvider.generateTokenForUsername(user.getEmail());
+        String teamName = user.getTeams().stream()
+                .findFirst().map(t -> t.getTeamName()).orElse(null);
+        return new AuthResponseDto(token, user.getEmail(), user.getName(), user.getRole().name(), teamName);
+    }
+
+    /** Thrown when a user with a pending invite tries to log in before setting their password. */
+    public static class AccountNotActivatedException extends RuntimeException {
+        public AccountNotActivatedException() {
+            super("Account not activated yet — check your email for the invitation link to set your password.");
+        }
     }
 
     public String register(RegisterDto registerDto) {

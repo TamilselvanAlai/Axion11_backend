@@ -23,13 +23,31 @@ public class AuthController {
     }
 
     @PostMapping("/login")
-    public ResponseEntity<AuthResponseDto> login(@RequestBody LoginDto loginDto) {
+    public ResponseEntity<?> login(@RequestBody LoginDto loginDto) {
         try {
             AuthResponseDto response = authService.login(loginDto);
             return ResponseEntity.ok(response);
+        } catch (AuthService.AccountNotActivatedException e) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(Map.of("error", e.getMessage()));
         } catch (Exception e) {
             e.printStackTrace();
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).build();
+        }
+    }
+
+    /** Public: redeems an invitation token and sets the invitee's password. */
+    @PostMapping("/activate")
+    public ResponseEntity<?> activate(@RequestBody Map<String, String> body) {
+        String token = body.get("token");
+        String password = body.get("password");
+        if (token == null || token.isEmpty() || password == null || password.length() < 6) {
+            return ResponseEntity.badRequest().body(Map.of("error", "Password must be at least 6 characters"));
+        }
+        try {
+            AuthResponseDto response = authService.activateAccount(token, password);
+            return ResponseEntity.ok(response);
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
         }
     }
 

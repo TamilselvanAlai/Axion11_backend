@@ -322,7 +322,7 @@ public class ImageUploadController {
      * Renames multiple uploads. Body: [ { "id": 1, "newFileName": "SKU_Front.jpg" }, ... ]
      */
     @PostMapping("/batch-rename")
-    @PreAuthorize("hasAnyRole('SUPER_ADMIN', 'ADMIN', 'CREATIVE_LEAD', 'PROJECT_MANAGER', 'CONTENT_MANAGER', 'DESIGNER')")
+    @PreAuthorize("hasAnyRole('SUPER_ADMIN', 'ADMIN', 'CREATIVE_LEAD', 'PROJECT_MANAGER', 'CONTENT_MANAGER', 'DESIGNER', 'REVIEWER', 'CLIENT')")
     public ResponseEntity<List<ImageUploadDto>> batchRename(@RequestBody List<Map<String, Object>> renames) {
         List<ImageUploadDto> results = imageUploadService.batchRename(renames);
         return ResponseEntity.ok(results);
