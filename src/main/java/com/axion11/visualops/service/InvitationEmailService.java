@@ -48,4 +48,29 @@ public class InvitationEmailService {
         sb.append("This link expires in 48 hours. If you didn't expect this invite, you can ignore this email.\n");
         return sb.toString();
     }
+
+    @Async
+    public void sendPasswordResetEmail(User user, String token) {
+        try {
+            String link = frontendUrl + "/reset-password?token=" + token;
+            SimpleMailMessage mail = new SimpleMailMessage();
+            mail.setTo(user.getEmail());
+            mail.setFrom(fromAddress);
+            mail.setSubject("Reset your Axion11 VisualOps password");
+            mail.setText(buildResetBody(user, link));
+            mailSender.send(mail);
+            log.info("Password reset email sent to {}", user.getEmail());
+        } catch (Exception e) {
+            log.error("Failed to send password reset email to {}: {}", user.getEmail(), e.getMessage());
+        }
+    }
+
+    private String buildResetBody(User user, String link) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("Hi ").append(user.getName() != null ? user.getName() : user.getEmail()).append(",\n\n");
+        sb.append("A password reset was requested for your Axion11 VisualOps account. Set a new password here:\n\n");
+        sb.append(link).append("\n\n");
+        sb.append("This link expires in 1 hour. If you didn't request this, you can ignore this email — your current password stays unchanged.\n");
+        return sb.toString();
+    }
 }

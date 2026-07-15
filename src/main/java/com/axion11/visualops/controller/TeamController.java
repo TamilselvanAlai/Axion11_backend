@@ -70,6 +70,7 @@ public class TeamController {
                 m.put("role", u.getRole() != null ? u.getRole().name() : null);
                 m.put("contact", u.getContactNumber());
                 m.put("country", u.getCountry());
+                m.put("activated", u.getInviteToken() == null);
                 m.put("teams", u.getTeams().stream()
                         .map(Team::getTeamName).collect(Collectors.toList()));
                 return m;
@@ -365,6 +366,26 @@ public class TeamController {
         return ResponseEntity.ok(Map.of("message", "Invitation resent"));
     }
 
+    // ── POST /api/teams/members/{id}/reset-password ──────────────────────────
+
+    @PostMapping("/teams/members/{id}/reset-password")
+    @PreAuthorize("hasAnyRole('SUPER_ADMIN', 'ADMIN')")
+    public ResponseEntity<Map<String, Object>> resetMemberPassword(@PathVariable("id") Long id) {
+        User user = userRepository.findById(id).orElse(null);
+        if (user == null) return ResponseEntity.notFound().build();
+        if (user.getInviteToken() != null) {
+            return ResponseEntity.badRequest().body(Map.of("error", "This member hasn't activated their account yet — use Resend Invite instead"));
+        }
+
+        String resetToken = UUID.randomUUID().toString();
+        user.setResetToken(resetToken);
+        user.setResetTokenExpiry(java.time.Instant.now().plus(java.time.Duration.ofHours(1)));
+        userRepository.save(user);
+        invitationEmailService.sendPasswordResetEmail(user, resetToken);
+
+        return ResponseEntity.ok(Map.of("message", "Password reset link sent"));
+    }
+
     // ── DELETE /api/teams/members/{id} ────────────────────────────────────────
 
     @DeleteMapping("/teams/members/{id}")
@@ -421,6 +442,7 @@ public class TeamController {
             m.put("role", u.getRole() != null ? u.getRole().name() : null);
             m.put("contact", u.getContactNumber());
             m.put("country", u.getCountry());
+            m.put("activated", u.getInviteToken() == null);
             return m;
         }).collect(Collectors.toList());
         return ResponseEntity.ok(result);

@@ -60,6 +60,13 @@ public class User implements UserDetails {
     @Column
     private java.time.Instant inviteTokenExpiry;
 
+    /** Non-null while a forgot-password/admin-reset link is outstanding; cleared on redemption. Unlike inviteToken, this never blocks login — the old password stays valid until the link is used. */
+    @Column(unique = true)
+    private String resetToken;
+
+    @Column
+    private java.time.Instant resetTokenExpiry;
+
     @Override
     public Collection<? extends GrantedAuthority> getAuthorities() {
         return List.of(new SimpleGrantedAuthority("ROLE_" + role.name()));

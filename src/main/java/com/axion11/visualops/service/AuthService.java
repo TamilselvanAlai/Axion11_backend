@@ -22,25 +22,30 @@ import java.util.UUID;
 @Service
 public class AuthService {
 
+    private static final java.time.Duration RESET_TOKEN_TTL = java.time.Duration.ofHours(1);
+
     private final AuthenticationManager authenticationManager;
     private final UserRepository userRepository;
     private final UserIdentityRepository userIdentityRepository;
     private final PasswordEncoder passwordEncoder;
     private final JwtTokenProvider jwtTokenProvider;
     private final GoogleSignInService googleSignInService;
+    private final InvitationEmailService invitationEmailService;
 
     public AuthService(AuthenticationManager authenticationManager,
             UserRepository userRepository,
             UserIdentityRepository userIdentityRepository,
             PasswordEncoder passwordEncoder,
             JwtTokenProvider jwtTokenProvider,
-            GoogleSignInService googleSignInService) {
+            GoogleSignInService googleSignInService,
+            InvitationEmailService invitationEmailService) {
         this.authenticationManager = authenticationManager;
         this.userRepository = userRepository;
         this.userIdentityRepository = userIdentityRepository;
         this.passwordEncoder = passwordEncoder;
         this.jwtTokenProvider = jwtTokenProvider;
         this.googleSignInService = googleSignInService;
+        this.invitationEmailService = invitationEmailService;
     }
 
     public AuthResponseDto login(LoginDto loginDto) {
@@ -83,6 +88,36 @@ public class AuthService {
         String teamName = user.getTeams().stream()
                 .findFirst().map(t -> t.getTeamName()).orElse(null);
         return new AuthResponseDto(token, user.getEmail(), user.getName(), user.getRole().name(), teamName);
+    }
+
+    /** Always succeeds regardless of whether the email matches a user, to avoid leaking which emails are registered. */
+    @Transactional
+    public void forgotPassword(String email) {
+        userRepository.findByEmail(email).ifPresent(user -> {
+            if (user.getInviteToken() != null) {
+                // Never activated — a reset link would be redundant/confusing; let them use the invite link instead.
+                return;
+            }
+            user.setResetToken(UUID.randomUUID().toString());
+            user.setResetTokenExpiry(java.time.Instant.now().plus(RESET_TOKEN_TTL));
+            userRepository.save(user);
+            invitationEmailService.sendPasswordResetEmail(user, user.getResetToken());
+        });
+    }
+
+    @Transactional
+    public void resetPassword(String resetToken, String newPassword) {
+        User user = userRepository.findByResetToken(resetToken)
+                .orElseThrow(() -> new RuntimeException("Invalid or already-used reset link"));
+
+        if (user.getResetTokenExpiry() == null || user.getResetTokenExpiry().isBefore(java.time.Instant.now())) {
+            throw new RuntimeException("This reset link has expired. Request a new one.");
+        }
+
+        user.setPassword(passwordEncoder.encode(newPassword));
+        user.setResetToken(null);
+        user.setResetTokenExpiry(null);
+        userRepository.save(user);
     }
 
     /** Thrown when a user with a pending invite tries to log in before setting their password. */
