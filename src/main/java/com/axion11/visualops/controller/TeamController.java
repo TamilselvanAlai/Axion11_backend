@@ -178,7 +178,7 @@ public class TeamController {
         User caller = userRepository.findByEmail(userDetails.getUsername()).orElseThrow();
 
         String teamNameStr = body.get("teamName");
-        if (caller.getRole() != Role.SUPER_ADMIN) {
+        if (caller.getRole() != Role.SUPER_ADMIN && caller.getRole() != Role.ADMIN) {
             boolean authorized = teamNameStr != null && caller.getTeams().stream()
                     .anyMatch(t -> teamNameStr.contains(t.getTeamName()));
             if (!authorized) {
@@ -282,7 +282,7 @@ public class TeamController {
         if (user == null) return ResponseEntity.notFound().build();
 
         User caller = userRepository.findByEmail(userDetails.getUsername()).orElseThrow();
-        if (caller.getRole() != Role.SUPER_ADMIN) {
+        if (caller.getRole() != Role.SUPER_ADMIN && caller.getRole() != Role.ADMIN) {
             final Set<Team> userTeams = user.getTeams();
             boolean sharedTeam = caller.getTeams().stream()
                     .anyMatch(t -> userTeams.stream()
@@ -398,7 +398,7 @@ public class TeamController {
         if (user == null) return ResponseEntity.notFound().build();
 
         User caller = userRepository.findByEmail(userDetails.getUsername()).orElseThrow();
-        if (caller.getRole() != Role.SUPER_ADMIN) {
+        if (caller.getRole() != Role.SUPER_ADMIN && caller.getRole() != Role.ADMIN) {
             boolean sharedTeam = caller.getTeams().stream()
                     .anyMatch(t -> user.getTeams().stream()
                             .anyMatch(ut -> ut.getId().equals(t.getId())));
