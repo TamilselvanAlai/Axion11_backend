@@ -17,7 +17,6 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.time.LocalDateTime;
 import java.util.Base64;
 import java.util.List;
 import java.util.stream.Collectors;
@@ -115,46 +114,12 @@ public class AssetService {
         commentRepository.deleteById(commentId);
     }
 
-    /** Freezes the current version as "approved" and opens a new "draft" version chained to it,
-     *  so further edits land on the new version instead of mutating the approved one. */
+    /** Flips the asset's status to "approved" in place. */
     @Transactional
     public AssetDetailDto approveAsset(String idOrExternalId) {
         ImageUpload upload = findUpload(idOrExternalId);
         upload.setApprovalStatus("approved");
         imageUploadRepository.save(upload);
-
-        int nextVersion = (upload.getVersionNumber() != null ? upload.getVersionNumber() : 1) + 1;
-        long originalUploadId = upload.getOriginalUploadId() != null ? upload.getOriginalUploadId() : upload.getId();
-
-        ImageUpload nextDraft = ImageUpload.builder()
-                .fileName(upload.getFileName())
-                .gcsPath(upload.getGcsPath())
-                .publicUrl(upload.getPublicUrl())
-                .contentType(upload.getContentType())
-                .fileSize(upload.getFileSize())
-                .sourcePath(upload.getSourcePath())
-                .project(upload.getProject())
-                .batch(upload.getBatch())
-                .uploadedBy(upload.getUploadedBy())
-                .createdAt(LocalDateTime.now())
-                .versionNumber(nextVersion)
-                .originalUploadId(originalUploadId)
-                .approvalStatus("draft")
-                .uploadStatus(upload.getUploadStatus())
-                .width(upload.getWidth())
-                .height(upload.getHeight())
-                .colorSpace(upload.getColorSpace())
-                .dpiX(upload.getDpiX())
-                .dpiY(upload.getDpiY())
-                .imageTitle(upload.getImageTitle())
-                .altText(upload.getAltText())
-                .description(upload.getDescription())
-                .previewUrl(upload.getPreviewUrl())
-                .assignedToUserId(upload.getAssignedToUserId())
-                .assignedToName(upload.getAssignedToName())
-                .build();
-        imageUploadRepository.save(nextDraft);
-
         return mapToDto(upload);
     }
 
