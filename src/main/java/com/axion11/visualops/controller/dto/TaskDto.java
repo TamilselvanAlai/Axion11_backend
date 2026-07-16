@@ -4,6 +4,7 @@ import lombok.Builder;
 import lombok.Data;
 
 import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.util.List;
 
 @Data
@@ -26,4 +27,5 @@ public class TaskDto {
     private String taskType;     // pre-production, production, post-production
     private String priority;     // low, medium, high
     private List<SubtaskDto> subtasks;
+    private LocalDateTime completedAt;
 }

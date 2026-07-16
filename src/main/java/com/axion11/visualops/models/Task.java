@@ -67,6 +67,10 @@ public class Task {
 
     private LocalDateTime createdAt;
 
+    /** Stamped when status transitions into COMPLETED, cleared if moved back out. Used to compute
+     *  "tasks completed today" for the dashboard — see TaskService#applyStatus. */
+    private LocalDateTime completedAt;
+
     @PrePersist
     protected void onCreate() {
         createdAt = LocalDateTime.now();

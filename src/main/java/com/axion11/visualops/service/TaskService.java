@@ -7,6 +7,7 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.LocalDateTime;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -33,6 +34,19 @@ public class TaskService {
             case "completed", "done" -> TaskStatus.COMPLETED;
             default -> TaskStatus.TO_DO;
         };
+    }
+
+    /** Sets task.status and keeps completedAt in sync: stamped on entry into COMPLETED,
+     *  cleared when moved back out. Centralized here so createTask/updateTask/moveTask agree. */
+    private void applyStatus(Task task, TaskStatus newStatus) {
+        boolean enteringCompleted = newStatus == TaskStatus.COMPLETED && task.getStatus() != TaskStatus.COMPLETED;
+        boolean leavingCompleted = newStatus != TaskStatus.COMPLETED && task.getStatus() == TaskStatus.COMPLETED;
+        task.setStatus(newStatus);
+        if (enteringCompleted) {
+            task.setCompletedAt(LocalDateTime.now());
+        } else if (leavingCompleted) {
+            task.setCompletedAt(null);
+        }
     }
 
     private String formatStatus(TaskStatus s) {
@@ -117,6 +131,7 @@ public class TaskService {
                 .taskType(formatTaskType(task.getTaskType()))
                 .priority(formatPriority(task.getPriority()))
                 .subtasks(subtaskDtos)
+                .completedAt(task.getCompletedAt())
                 .build();
     }
 
@@ -181,6 +196,10 @@ public class TaskService {
                 .priority(parsePriority(req.getPriority()))
                 .build();
 
+        if (task.getStatus() == TaskStatus.COMPLETED) {
+            task.setCompletedAt(LocalDateTime.now());
+        }
+
         task = taskRepository.save(task);
 
         if (req.getSubtasks() != null) {
@@ -210,7 +229,7 @@ public class TaskService {
                 .orElseThrow(() -> new RuntimeException("Task not found: " + id));
 
         if (req.getTitle() != null) task.setTitle(req.getTitle());
-        if (req.getStatus() != null) task.setStatus(parseStatus(req.getStatus()));
+        if (req.getStatus() != null) applyStatus(task, parseStatus(req.getStatus()));
         if (req.getStartDate() != null) task.setStartDate(req.getStartDate());
         if (req.getDueDate() != null) task.setDueDate(req.getDueDate());
         if (req.getLinkedAssets() != null) task.setLinkedAssets(req.getLinkedAssets());
@@ -265,7 +284,7 @@ public class TaskService {
     public TaskDto moveTask(Long id, String status) {
         Task task = taskRepository.findById(id)
                 .orElseThrow(() -> new RuntimeException("Task not found: " + id));
-        task.setStatus(parseStatus(status));
+        applyStatus(task, parseStatus(status));
         return toDto(taskRepository.save(task));
     }
 

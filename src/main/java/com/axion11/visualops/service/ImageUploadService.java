@@ -1926,7 +1926,8 @@ public class ImageUploadService {
                 u.getVersionNumber() != null ? u.getVersionNumber() : 1,
                 u.getOriginalUploadId(),
                 u.getAssignedToUserId(),
-                u.getAssignedToName()
+                u.getAssignedToName(),
+                u.getApprovalStatus()
         );
     }
 

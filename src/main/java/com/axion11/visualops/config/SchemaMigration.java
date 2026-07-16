@@ -22,6 +22,18 @@ public class SchemaMigration implements ApplicationRunner {
     public void run(ApplicationArguments args) {
         alterColumnNullable("comments", "asset_id");
         rewriteOldBucketUrls();
+        renamePendingApprovalStatusToDraft();
+    }
+
+    /** approvalStatus's default changed from "pending" to "draft" (draft -> approved -> live
+     *  lifecycle). Existing rows still say "pending" — bring them in line. Idempotent. */
+    private void renamePendingApprovalStatusToDraft() {
+        try {
+            int updated = jdbc.update("UPDATE image_uploads SET approval_status = 'draft' WHERE approval_status = 'pending'");
+            if (updated > 0) log.info("Schema migration: renamed approval_status 'pending' -> 'draft' on {} rows", updated);
+        } catch (Exception e) {
+            log.debug("Schema migration skipped for image_uploads.approval_status: {}", e.getMessage());
+        }
     }
 
     private void alterColumnNullable(String table, String column) {

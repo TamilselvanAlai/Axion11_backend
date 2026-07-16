@@ -27,5 +27,6 @@ public record ImageUploadDto(
         Integer versionNumber,
         Long originalUploadId,
         Long assignedToUserId,
-        String assignedToName
+        String assignedToName,
+        String approvalStatus
 ) {}

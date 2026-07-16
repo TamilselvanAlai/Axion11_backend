@@ -79,4 +79,14 @@ public class AssetController {
     public ResponseEntity<AssetDetailDto> rejectAsset(@PathVariable("id") String id) {
         return ResponseEntity.ok(assetService.rejectAsset(id));
     }
+
+    @PostMapping("/{id}/publish")
+    @PreAuthorize("hasAnyRole('SUPER_ADMIN', 'ADMIN', 'CREATIVE_LEAD', 'REVIEWER', 'CLIENT')")
+    public ResponseEntity<?> publishAsset(@PathVariable("id") String id) {
+        try {
+            return ResponseEntity.ok(assetService.publishAsset(id));
+        } catch (IllegalStateException e) {
+            return ResponseEntity.badRequest().body(e.getMessage());
+        }
+    }
 }

@@ -51,10 +51,11 @@ public class ImageUpload {
 
     private Integer aiScore;
 
-    /** approved, pending, rejected — asset-level approval status */
+    /** draft, approved, rejected, live — asset-level approval/lifecycle status.
+     *  draft -> approved (freezes this version, opens a new draft version) -> live (published). */
     @Builder.Default
     @Column(length = 20)
-    private String approvalStatus = "pending";
+    private String approvalStatus = "draft";
 
     /** PENDING, UPLOADING, COMPLETED, FAILED */
     @Builder.Default
