@@ -217,6 +217,17 @@ public class ImageUploadController {
     }
 
     /**
+     * POST /api/uploads/backfill-previews
+     * Regenerates thumbnails for existing PSD/RAW/MP4 uploads that don't have one yet (uploaded
+     * before preview generation existed, or whose original generation attempt failed).
+     */
+    @PostMapping("/backfill-previews")
+    public ResponseEntity<String> backfillPreviews() {
+        int updated = imageUploadService.backfillPreviews();
+        return ResponseEntity.ok("Generated previews for " + updated + " uploads");
+    }
+
+    /**
      * PUT /api/uploads/{id}/angle
      * Updates the angle tag for an upload.
      */

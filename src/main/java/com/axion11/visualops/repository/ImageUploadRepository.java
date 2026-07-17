@@ -35,6 +35,9 @@ public interface ImageUploadRepository extends JpaRepository<ImageUpload, Long> 
     /** All versions that share the same original upload (v2, v3, …), oldest first. */
     List<ImageUpload> findByOriginalUploadIdOrderByVersionNumberAsc(Long originalUploadId);
 
+    /** Uploads with no generated preview yet — candidates for the PSD/RAW/video preview backfill. */
+    List<ImageUpload> findByPreviewUrlIsNull();
+
     /** Case-insensitive file-name substring search, scoped to one project — powers the DAM search bar. */
     @EntityGraph(attributePaths = {"tags", "project", "batch", "uploadedBy"})
     List<ImageUpload> findByProjectIdAndFileNameContainingIgnoreCaseOrderByCreatedAtDesc(Long projectId, String fileName);

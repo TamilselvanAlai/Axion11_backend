@@ -66,6 +66,25 @@ if ($FRONTEND_CLOUD_RUN_URL) {
 Write-Host "--> Deploying Backend to Cloud Run..."
 $unixTime = [int][datetime]::UtcNow.Subtract((New-Object datetime 1970, 1, 1)).TotalSeconds
 
+# Vars this script computes/owns directly (order matches the historical hardcoded list).
+$envVars = "SERVER_PORT=8080|DB_URL=jdbc:mysql:///${DB_NAME}?cloudSqlInstance=${INSTANCE_CONNECTION_NAME}&socketFactory=com.google.cloud.sql.mysql.SocketFactory&useSSL=false|DB_USER=${DB_USER}|DB_PASSWORD=${DB_PASSWORD}|JWT_SECRET=${JWT_SECRET}|JWT_EXPIRATION=86400000|CORS_ORIGINS=${CORS_ORIGINS}|GCS_BUCKET_NAME=${GCS_BUCKET_NAME}|GEMINI_API_KEY=${GEMINI_API_KEY}|GOOGLE_DRIVE_CLIENT_ID=${GOOGLE_DRIVE_CLIENT_ID}|GOOGLE_DRIVE_CLIENT_SECRET=${GOOGLE_DRIVE_CLIENT_SECRET}|GOOGLE_SIGNIN_REDIRECT_URI=${GOOGLE_SIGNIN_REDIRECT_URI}|SEED_DEMO_DATA=${SEED_DEMO_DATA}"
+$ownedKeys = @("SERVER_PORT","DB_URL","DB_USER","DB_PASSWORD","JWT_SECRET","JWT_EXPIRATION","CORS_ORIGINS","GCS_BUCKET_NAME","GEMINI_API_KEY","GOOGLE_DRIVE_CLIENT_ID","GOOGLE_DRIVE_CLIENT_SECRET","GOOGLE_SIGNIN_REDIRECT_URI","SEED_DEMO_DATA")
+
+# Forward every other var defined in .env verbatim (Google desktop client id, mail, OneDrive,
+# etc.) so new config only ever needs to be added in one place instead of being hand-copied
+# here too — a var present in .env but missing from this list is exactly what silently broke
+# desktop Google sign-in on 2026-07-16.
+$envFile = Join-Path $PSScriptRoot ".env"
+if (Test-Path $envFile) {
+    foreach ($line in Get-Content $envFile) {
+        if ($line -notmatch '^[A-Z_]+=') { continue }
+        $key, $value = $line -split '=', 2
+        if ($ownedKeys -contains $key) { continue }
+        if ([string]::IsNullOrEmpty($value)) { continue }
+        $envVars += "|$key=$value"
+    }
+}
+
 gcloud run deploy axion11-backend `
     --image $BACKEND_IMG `
     --region $REGION `
@@ -75,7 +94,7 @@ gcloud run deploy axion11-backend `
     --cpu 2 `
     --timeout 600 `
     --execution-environment gen2 `
-    --set-env-vars "^|^SERVER_PORT=8080|DB_URL=jdbc:mysql:///${DB_NAME}?cloudSqlInstance=${INSTANCE_CONNECTION_NAME}&socketFactory=com.google.cloud.sql.mysql.SocketFactory&useSSL=false|DB_USER=${DB_USER}|DB_PASSWORD=${DB_PASSWORD}|JWT_SECRET=${JWT_SECRET}|JWT_EXPIRATION=86400000|CORS_ORIGINS=${CORS_ORIGINS}|GCS_BUCKET_NAME=${GCS_BUCKET_NAME}|GEMINI_API_KEY=${GEMINI_API_KEY}|GOOGLE_DRIVE_CLIENT_ID=${GOOGLE_DRIVE_CLIENT_ID}|GOOGLE_DRIVE_CLIENT_SECRET=${GOOGLE_DRIVE_CLIENT_SECRET}|GOOGLE_SIGNIN_REDIRECT_URI=${GOOGLE_SIGNIN_REDIRECT_URI}|SEED_DEMO_DATA=${SEED_DEMO_DATA}" `
+    --set-env-vars "^|^${envVars}" `
     --add-cloudsql-instances ${INSTANCE_CONNECTION_NAME} `
     --revision-suffix="$unixTime"
 

@@ -683,6 +683,38 @@ public class ImageUploadService {
         return updated;
     }
 
+    /**
+     * Regenerates JPEG previews for existing PSD/RAW/video uploads that don't have one yet —
+     * either because they were uploaded before preview generation existed, or because the
+     * original generation attempt failed. Re-downloads each file and re-runs the same
+     * extraction pipeline used on upload.
+     */
+    public int backfillPreviews() {
+        List<ImageUpload> candidates = imageUploadRepository.findByPreviewUrlIsNull().stream()
+                .filter(u -> needsPreview(u.getFileName()) || isVideoPreview(u.getFileName()))
+                .toList();
+
+        java.net.http.HttpClient httpClient = java.net.http.HttpClient.newHttpClient();
+        int updated = 0;
+        for (ImageUpload upload : candidates) {
+            try {
+                byte[] bytes = downloadImage(httpClient, upload.getPublicUrl());
+                if (bytes == null) {
+                    log.warn("Backfill: could not download {} ({})", upload.getFileName(), upload.getId());
+                    continue;
+                }
+                extractAndSaveMetadata(upload, bytes);
+                if (upload.getPreviewUrl() != null) {
+                    updated++;
+                }
+            } catch (Exception e) {
+                log.error("Backfill failed for upload {} ({}): {}", upload.getId(), upload.getFileName(), e.getMessage(), e);
+            }
+        }
+        log.info("Preview backfill complete: {}/{} candidates got a new preview", updated, candidates.size());
+        return updated;
+    }
+
     // ── Core processing ───────────────────────────────────────────────────────
 
     private ImageUploadDto processSingleUpload(MultipartFile file, Project project, User uploader) throws Exception {
@@ -1036,6 +1068,20 @@ public class ImageUploadService {
     }
 
     private void extractAndSaveMetadata(ImageUpload imageUpload, byte[] bytes) {
+        if (isVideoPreview(imageUpload.getFileName())) {
+            try {
+                String previewUrl = extractVideoFramePreview(bytes, imageUpload);
+                if (previewUrl != null) {
+                    imageUpload.setPreviewUrl(previewUrl);
+                    log.info("Generated video frame preview for {}: {}", imageUpload.getFileName(), previewUrl);
+                }
+            } catch (Exception e) {
+                log.warn("Failed to extract video frame preview for {}: {}", imageUpload.getFileName(), e.getMessage());
+            }
+            imageUploadRepository.save(imageUpload);
+            return;
+        }
+
         try {
             java.io.ByteArrayInputStream bais = new java.io.ByteArrayInputStream(bytes);
             javax.imageio.stream.ImageInputStream iis = javax.imageio.ImageIO.createImageInputStream(bais);
@@ -1054,7 +1100,14 @@ public class ImageUploadService {
                         }
                     } catch (Exception ignore) {}
                     try {
-                        java.awt.image.BufferedImage img = reader.read(0);
+                        java.awt.image.BufferedImage img;
+                        try {
+                            img = reader.read(0);
+                        } catch (Exception readEx) {
+                            log.warn("ImageIO could not decode {} (reader {}): {}",
+                                    imageUpload.getFileName(), reader.getClass().getSimpleName(), readEx.getMessage());
+                            img = null;
+                        }
                         if (img != null) {
                             java.awt.color.ColorSpace cs = img.getColorModel().getColorSpace();
                             if (cs.getType() == java.awt.color.ColorSpace.TYPE_RGB) {
@@ -1117,6 +1170,57 @@ public class ImageUploadService {
     }
 
     /**
+     * Video containers JCodec can demux (MP4-family/QuickTime). Other video extensions the
+     * frontend recognizes (avi, webm, mkv, wmv, flv, mpg/mpeg) use codecs/containers JCodec
+     * doesn't support and still fall back to the generic file-type icon.
+     */
+    private static final Set<String> VIDEO_PREVIEW_EXTS = Set.of("mp4", "mov", "m4v");
+
+    private boolean isVideoPreview(String fileName) {
+        if (fileName == null) return false;
+        int dot = fileName.lastIndexOf('.');
+        if (dot < 0) return false;
+        return VIDEO_PREVIEW_EXTS.contains(fileName.substring(dot + 1).toLowerCase());
+    }
+
+    /**
+     * Grabs a frame ~1s into the video (skips a possibly-black opening frame) via JCodec's
+     * pure-Java MP4/QuickTime decoder, and uploads it as the JPEG preview/thumbnail.
+     */
+    private String extractVideoFramePreview(byte[] bytes, ImageUpload imageUpload) {
+        java.io.File tempFile = null;
+        try {
+            tempFile = java.io.File.createTempFile("video_preview_", ".mp4");
+            java.nio.file.Files.write(tempFile.toPath(), bytes);
+
+            org.jcodec.common.model.Picture picture;
+            try (org.jcodec.common.io.FileChannelWrapper ch = org.jcodec.common.io.NIOUtils.readableChannel(tempFile)) {
+                org.jcodec.api.FrameGrab grab = org.jcodec.api.FrameGrab.createFrameGrab(ch);
+                try {
+                    grab.seekToSecondPrecise(1.0);
+                } catch (Exception seekEx) {
+                    // Clip shorter than 1s — fall through and grab whatever frame is current (the first one).
+                }
+                picture = grab.getNativeFrame();
+            }
+            if (picture == null) {
+                log.warn("JCodec returned no frame for {}", imageUpload.getFileName());
+                return null;
+            }
+
+            java.awt.image.BufferedImage frame = org.jcodec.scale.AWTUtil.toBufferedImage(picture);
+            imageUpload.setWidth(frame.getWidth());
+            imageUpload.setHeight(frame.getHeight());
+            return generateAndUploadPreview(frame, imageUpload);
+        } catch (Exception e) {
+            log.warn("Video frame extraction failed for {}: {}", imageUpload.getFileName(), e.getMessage());
+            return null;
+        } finally {
+            if (tempFile != null) tempFile.delete();
+        }
+    }
+
+    /**
      * Converts a BufferedImage to JPEG, uploads to GCS as a preview, and returns the public URL.
      */
     private String generateAndUploadPreview(java.awt.image.BufferedImage img, ImageUpload imageUpload) {
@@ -1158,52 +1262,47 @@ public class ImageUploadService {
     }
 
     /**
-     * Extracts the embedded JPEG preview from RAW camera files (CR3, CR2, NEF, ARW, DNG)
-     * using metadata-extractor. Most RAW files contain a full-size or half-size JPEG preview.
+     * Extracts an embedded JPEG preview from formats ImageIO can't fully decode: RAW camera
+     * files (CR3, CR2, NEF, ARW, DNG) via their Exif preview tags, and PSD/AI/etc. via their
+     * embedded thumbnail resource. Two independent passes — the Exif-tag lookup and the
+     * byte-level scan run as separate try blocks so a metadata-extractor parse failure on one
+     * file type (e.g. an unusual PSD/CR3 structure) doesn't skip the more universal byte scan.
      */
     private String extractEmbeddedPreview(byte[] rawBytes, ImageUpload imageUpload) {
+        // Pass 1: Exif JPEGInterchangeFormat tags (0x0201/0x0202) — mainly RAW camera files.
         try {
             com.drew.metadata.Metadata metadata = com.drew.imaging.ImageMetadataReader.readMetadata(
                     new java.io.ByteArrayInputStream(rawBytes));
 
-            // Look for JPEG preview in Exif thumbnail or preview image tags
             for (com.drew.metadata.Directory dir : metadata.getDirectories()) {
-                // Check for large preview in Exif IFD
-                // TAG IDs: JPEGInterchangeFormat=0x0201, JPEGInterchangeFormatLength=0x0202
                 if (dir.containsTag(0x0201) && dir.containsTag(0x0202)) {
                     int offset = dir.getInt(0x0201);
                     int length = dir.getInt(0x0202);
                     if (offset > 0 && length > 1000 && offset + length <= rawBytes.length) {
                         byte[] jpegBytes = java.util.Arrays.copyOfRange(rawBytes, offset, offset + length);
-                        // Verify it's a valid JPEG (starts with FF D8)
                         if (jpegBytes.length > 2 && (jpegBytes[0] & 0xFF) == 0xFF && (jpegBytes[1] & 0xFF) == 0xD8) {
-                            String previewFileName = "previews/" + imageUpload.getId() + "_preview.jpg";
-                            uploadToGcs(previewFileName, jpegBytes, "image/jpeg");
-
-                            // Also extract dimensions from the preview
-                            try {
-                                java.awt.image.BufferedImage previewImg = javax.imageio.ImageIO.read(new java.io.ByteArrayInputStream(jpegBytes));
-                                if (previewImg != null) {
-                                    imageUpload.setWidth(previewImg.getWidth());
-                                    imageUpload.setHeight(previewImg.getHeight());
-                                }
-                            } catch (Exception ignore) {}
-
-                            return "https://storage.googleapis.com/" + bucketName + "/" + previewFileName;
+                            String previewUrl = uploadPreviewJpeg(jpegBytes, imageUpload);
+                            log.info("Extracted Exif-tagged preview for {}", imageUpload.getFileName());
+                            return previewUrl;
                         }
                     }
                 }
             }
+        } catch (Exception e) {
+            log.warn("metadata-extractor pass failed for {} ({}) — falling back to byte scan",
+                    imageUpload.getFileName(), e.getMessage());
+        }
 
-            // Fallback: scan for largest JPEG segment in the raw file
+        // Pass 2: brute-force scan for the largest embedded JPEG segment (FFD8...FFD9). Works
+        // for PSD/AI thumbnail resources and any RAW variant regardless of container structure.
+        try {
             int bestOffset = -1, bestLength = 0;
             for (int i = 0; i < rawBytes.length - 3; i++) {
                 if ((rawBytes[i] & 0xFF) == 0xFF && (rawBytes[i + 1] & 0xFF) == 0xD8) {
-                    // Found JPEG SOI marker, scan for EOI
                     for (int j = i + 2; j < rawBytes.length - 1; j++) {
                         if ((rawBytes[j] & 0xFF) == 0xFF && (rawBytes[j + 1] & 0xFF) == 0xD9) {
                             int len = j - i + 2;
-                            if (len > bestLength && len > 10000) { // Only consider JEPGs > 10KB
+                            if (len > bestLength && len > 10000) { // Only consider JPEGs > 10KB
                                 bestOffset = i;
                                 bestLength = len;
                             }
@@ -1214,18 +1313,33 @@ public class ImageUploadService {
             }
             if (bestOffset >= 0) {
                 byte[] jpegBytes = java.util.Arrays.copyOfRange(rawBytes, bestOffset, bestOffset + bestLength);
-                String previewFileName = "previews/" + imageUpload.getId() + "_preview.jpg";
-                uploadToGcs(previewFileName, jpegBytes, "image/jpeg");
-                log.info("Extracted JPEG preview from RAW scan: {} bytes at offset {}", bestLength, bestOffset);
-                return "https://storage.googleapis.com/" + bucketName + "/" + previewFileName;
+                String previewUrl = uploadPreviewJpeg(jpegBytes, imageUpload);
+                log.info("Extracted JPEG preview from byte scan for {}: {} bytes at offset {}",
+                        imageUpload.getFileName(), bestLength, bestOffset);
+                return previewUrl;
             }
-
-            log.warn("No embedded JPEG preview found in {}", imageUpload.getFileName());
-            return null;
         } catch (Exception e) {
-            log.warn("Failed to extract embedded preview: {}", e.getMessage());
+            log.warn("Byte-scan preview extraction failed for {}: {}", imageUpload.getFileName(), e.getMessage());
             return null;
         }
+
+        log.warn("No embedded JPEG preview found in {}", imageUpload.getFileName());
+        return null;
+    }
+
+    /** Uploads a JPEG preview to GCS, also setting width/height from its own dimensions, and returns its public URL. */
+    private String uploadPreviewJpeg(byte[] jpegBytes, ImageUpload imageUpload) {
+        try {
+            java.awt.image.BufferedImage previewImg = javax.imageio.ImageIO.read(new java.io.ByteArrayInputStream(jpegBytes));
+            if (previewImg != null) {
+                imageUpload.setWidth(previewImg.getWidth());
+                imageUpload.setHeight(previewImg.getHeight());
+            }
+        } catch (Exception ignore) {}
+
+        String previewFileName = "previews/" + imageUpload.getId() + "_preview.jpg";
+        uploadToGcs(previewFileName, jpegBytes, "image/jpeg");
+        return "https://storage.googleapis.com/" + bucketName + "/" + previewFileName;
     }
 
     // ── GCS upload ────────────────────────────────────────────────────────────
