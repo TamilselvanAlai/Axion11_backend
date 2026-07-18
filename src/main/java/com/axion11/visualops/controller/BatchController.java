@@ -2,6 +2,7 @@ package com.axion11.visualops.controller;
 
 import com.axion11.visualops.controller.dto.BatchDto;
 import com.axion11.visualops.controller.dto.BatchRequest;
+import com.axion11.visualops.controller.dto.ImageUploadDto;
 import com.axion11.visualops.repository.BatchRepository;
 import com.axion11.visualops.service.BatchService;
 import com.axion11.visualops.service.BatchService.FileData;
@@ -161,6 +162,21 @@ public class BatchController {
         }
 
         return ResponseEntity.ok(batch);
+    }
+
+    /**
+     * POST /api/batches/{id}/upload-sync
+     * Synchronous single-file upload — used by the desktop app's edit-and-resync flow, which
+     * needs the newly created version's id back immediately. The async /upload/{id} endpoint
+     * above can't provide that: its processing happens on a background thread, so its response
+     * returns before the row exists.
+     */
+    @PostMapping(value = "/{id}/upload-sync", consumes = "multipart/form-data")
+    public ResponseEntity<ImageUploadDto> uploadToBatchSync(
+            @PathVariable("id") Long id,
+            @RequestParam("file") MultipartFile file,
+            @AuthenticationPrincipal UserDetails userDetails) throws IOException {
+        return ResponseEntity.ok(batchService.uploadSingleImageSync(id, file, userDetails.getUsername()));
     }
 
     /**

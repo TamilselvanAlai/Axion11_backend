@@ -12,7 +12,9 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.multipart.MultipartFile;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.NoSuchElementException;
@@ -201,6 +203,36 @@ public class BatchService {
                 log.error("Phase 2 task wait failed for batch {}: {}", batchId, e.getMessage());
             }
         }
+    }
+
+    /** Synchronously uploads a single file to a batch and returns the created row immediately —
+     *  used by the desktop app's edit-and-resync flow, which needs the new version's id right
+     *  away to switch the UI over to it. {@link #uploadImagesAsync} can't be used for this since
+     *  it runs on a background thread and its HTTP response returns before the row exists.
+     *  Deliberately skips the batch upload-counter/deferred-AI-analysis bookkeeping that bulk
+     *  uploads do — this is a re-save of an existing asset, not a new addition to the batch. */
+    public ImageUploadDto uploadSingleImageSync(Long batchId, MultipartFile file, String uploaderEmail) throws IOException {
+        Batch batch = batchRepository.findById(batchId)
+                .orElseThrow(() -> new NoSuchElementException("Batch not found: " + batchId));
+        Long projectId = batch.getProject().getId();
+
+        ImageUploadDto result = imageUploadService.uploadImageFast(
+                file.getOriginalFilename(),
+                file.getContentType(),
+                file.getSize(),
+                file.getBytes(),
+                projectId,
+                uploaderEmail,
+                batchId
+        );
+
+        imageUploadRepository.findById(result.id()).ifPresent(imageUpload -> {
+            imageUpload.setBatch(batch);
+            imageUpload.setUploadStatus("COMPLETED");
+            imageUploadRepository.save(imageUpload);
+        });
+
+        return result;
     }
 
     @Transactional

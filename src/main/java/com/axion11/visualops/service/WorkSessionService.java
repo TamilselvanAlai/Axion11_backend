@@ -18,6 +18,7 @@ import java.util.List;
 public class WorkSessionService {
 
     private final WorkSessionRepository workSessionRepository;
+    private final AssetEditSessionService assetEditSessionService;
 
     @Transactional
     public WorkSession startSession(User user) {
@@ -45,6 +46,7 @@ public class WorkSessionService {
                     session.setLogoutTime(LocalDateTime.now());
                     workSessionRepository.save(session);
                 });
+        assetEditSessionService.closeDangling(user, "SESSION_END");
     }
 
     @Transactional
