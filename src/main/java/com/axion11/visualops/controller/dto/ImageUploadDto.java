@@ -28,5 +28,6 @@ public record ImageUploadDto(
         Long originalUploadId,
         Long assignedToUserId,
         String assignedToName,
-        String approvalStatus
+        String approvalStatus,
+        boolean established
 ) {}

@@ -232,7 +232,11 @@ public class BatchService {
             imageUploadRepository.save(imageUpload);
         });
 
-        return result;
+        // This save is an editor's actual edit-and-resync — it becomes the new VE (established)
+        // version, the original-format source to rework from, regardless of approval status.
+        imageUploadService.markEstablished(result.id());
+
+        return imageUploadService.getUpload(result.id());
     }
 
     @Transactional
@@ -431,7 +435,8 @@ public class BatchService {
                     u.getOriginalUploadId(),
                     u.getAssignedToUserId(),
                     u.getAssignedToName(),
-                    u.getApprovalStatus()
+                    u.getApprovalStatus(),
+                    u.isEstablished()
             );
         }).collect(Collectors.toList());
 

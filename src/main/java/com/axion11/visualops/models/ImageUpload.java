@@ -51,11 +51,21 @@ public class ImageUpload {
 
     private Integer aiScore;
 
-    /** draft, approved, rejected, live — asset-level approval/lifecycle status.
-     *  draft -> approved (freezes this version, opens a new draft version) -> live (published). */
+    /** draft, approved, rejected, live — asset-level approval/lifecycle status, flipped in
+     *  place on this same version row (approving/rejecting never forks a new version). */
     @Builder.Default
     @Column(length = 20)
     private String approvalStatus = "draft";
+
+    /** True on exactly one version per version-chain at a time — the most recent version an
+     *  editor actually saved through the desktop app's edit-and-resync flow (see
+     *  BatchService#uploadSingleImageSync), i.e. the original-format (TIFF/PSD, layered) source
+     *  to rework from. Independent of approvalStatus: a numbered/"latest" version could be a
+     *  flattened export uploaded through a different path, which is exactly what this flag
+     *  exists to not be mistaken for. */
+    @Builder.Default
+    @Column(nullable = false)
+    private boolean established = false;
 
     /** PENDING, UPLOADING, COMPLETED, FAILED */
     @Builder.Default

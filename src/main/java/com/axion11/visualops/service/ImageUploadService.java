@@ -2041,7 +2041,8 @@ public class ImageUploadService {
                 u.getOriginalUploadId(),
                 u.getAssignedToUserId(),
                 u.getAssignedToName(),
-                u.getApprovalStatus()
+                u.getApprovalStatus(),
+                u.isEstablished()
         );
     }
 
@@ -2049,6 +2050,12 @@ public class ImageUploadService {
      * Returns all versions of a file (v1 first), identified by any version's upload ID.
      */
     public List<ImageUploadDto> getAllVersions(Long uploadId) {
+        return resolveVersionChain(uploadId).stream().map(this::toDto).collect(Collectors.toList());
+    }
+
+    /** Every version row in the same chain as {@code uploadId} (v1 first), regardless of which
+     *  version's id is passed in. Empty if the upload doesn't exist. */
+    private List<ImageUpload> resolveVersionChain(Long uploadId) {
         ImageUpload upload = imageUploadRepository.findById(uploadId).orElse(null);
         if (upload == null) return List.of();
 
@@ -2059,8 +2066,24 @@ public class ImageUploadService {
         List<ImageUpload> versions = new ArrayList<>();
         versions.add(v1);
         versions.addAll(imageUploadRepository.findByOriginalUploadIdOrderByVersionNumberAsc(rootId));
+        return versions;
+    }
 
-        return versions.stream().map(this::toDto).collect(Collectors.toList());
+    /** Marks {@code uploadId} as the established (VE) version — the current source-of-truth,
+     *  original-format working file to rework from — clearing the flag from whichever other
+     *  version in the same chain held it before. Called whenever an editor saves through the
+     *  desktop app's edit-and-resync flow (see BatchService#uploadSingleImageSync);
+     *  deliberately not tied to approval, since the approved/"latest" version could be a
+     *  flattened export uploaded through a different path. */
+    @Transactional
+    public void markEstablished(Long uploadId) {
+        for (ImageUpload version : resolveVersionChain(uploadId)) {
+            boolean shouldBeEstablished = version.getId().equals(uploadId);
+            if (version.isEstablished() != shouldBeEstablished) {
+                version.setEstablished(shouldBeEstablished);
+                imageUploadRepository.save(version);
+            }
+        }
     }
 
     /**
