@@ -64,7 +64,7 @@ gcloud run deploy axion11-backend \
     --cpu 2 \
     --timeout 600 \
     --execution-environment gen2 \
-    --set-env-vars "^|^SERVER_PORT=8080|DB_URL=jdbc:mysql:///${DB_NAME}?cloudSqlInstance=${INSTANCE_CONNECTION_NAME}&socketFactory=com.google.cloud.sql.mysql.SocketFactory&useSSL=false|DB_USER=${DB_USER}|DB_PASSWORD=${DB_PASSWORD}|JWT_SECRET=${JWT_SECRET}|JWT_EXPIRATION=86400000|CORS_ORIGINS=https://imagemx.online,https://www.imagemx.online,${FRONTEND_CLOUD_RUN_URL}|GCS_BUCKET_NAME=${GCS_BUCKET_NAME}|GEMINI_API_KEY=${GEMINI_API_KEY}" \
+    --set-env-vars "^|^SERVER_PORT=8080|DB_URL=jdbc:mysql:///${DB_NAME}?cloudSqlInstance=${INSTANCE_CONNECTION_NAME}&socketFactory=com.google.cloud.sql.mysql.SocketFactory&useSSL=false|DB_USER=${DB_USER}|DB_PASSWORD=${DB_PASSWORD}|JWT_SECRET=${JWT_SECRET}|JWT_EXPIRATION=86400000|CORS_ORIGINS=https://imagemx.online,https://www.imagemx.online,${FRONTEND_CLOUD_RUN_URL}|FRONTEND_URL=https://imagemx.online|GCS_BUCKET_NAME=${GCS_BUCKET_NAME}|GEMINI_API_KEY=${GEMINI_API_KEY}" \
     --add-cloudsql-instances ${INSTANCE_CONNECTION_NAME} \
     --revision-suffix="$(date +%s)"
 

@@ -57,6 +57,24 @@ public class ImageUploadController {
     }
 
     /**
+     * POST /api/uploads/{id}/replace-content
+     * Replaces an existing upload's file in place — same row, same version number — instead of
+     * creating a new version. Used by the desktop app's edit-and-resync flow: an editor's save
+     * becomes draft + established (VE) on the version they were already working on; the version
+     * number itself only advances when QC approves it (see AssetController#approveAsset).
+     */
+    @PostMapping("/{id}/replace-content")
+    public ResponseEntity<ImageUploadDto> replaceContent(
+            @PathVariable("id") Long id,
+            @RequestBody Map<String, Object> body) {
+        String gcsFileName = (String) body.get("gcsFileName");
+        String contentType = (String) body.get("contentType");
+        long fileSize = ((Number) body.get("fileSize")).longValue();
+        ImageUploadDto result = imageUploadService.replaceContent(id, gcsFileName, contentType, fileSize);
+        return ResponseEntity.ok(result);
+    }
+
+    /**
      * POST /api/uploads
      * Multipart form: files[] + optional projectId
      * Uploads images to GCS and runs Vision API tagging.

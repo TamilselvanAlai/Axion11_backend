@@ -762,6 +762,40 @@ public class ImageUploadService {
     }
 
     /**
+     * Replaces an existing upload's file content in place — same row, same version number —
+     * instead of creating a new version row. Used by the desktop app's edit-and-resync flow: a
+     * local edit becomes draft + established (the current version an editor is working on), and
+     * the version number itself only advances when QC approves it (AssetService#approveAsset
+     * already advances-in-place on approval, so this keeps the same row-reuse pattern on the
+     * editing side too, instead of forking a new row on every save).
+     */
+    @Transactional
+    public ImageUploadDto replaceContent(Long uploadId, String gcsFileName, String contentType, long fileSize) {
+        ImageUpload upload = imageUploadRepository.findById(uploadId)
+                .orElseThrow(() -> new NoSuchElementException("Upload not found: " + uploadId));
+
+        upload.setGcsPath("gs://" + bucketName + "/" + gcsFileName);
+        upload.setPublicUrl("https://storage.googleapis.com/" + bucketName + "/" + gcsFileName);
+        // The old preview (if any) belonged to the pre-edit content — clear it so the UI falls
+        // back to the fresh publicUrl instead of showing a stale thumbnail of the old version.
+        upload.setPreviewUrl(null);
+        upload.setContentType(contentType);
+        upload.setFileSize(fileSize);
+        upload.setApprovalStatus("draft");
+        // The old automated QC result was for the pre-edit content — clear it so status
+        // resolution (which falls back to this when approvalStatus isn't an explicit
+        // approved/rejected/live) can't read a stale "PASSED" and show this fresh, unreviewed
+        // edit as already approved.
+        upload.setImageQualityQcCheck(null);
+        upload.setCreatedAt(LocalDateTime.now());
+        imageUploadRepository.save(upload);
+
+        markEstablished(uploadId);
+
+        return getUpload(uploadId);
+    }
+
+    /**
      * Confirms a file uploaded directly to GCS. Creates DB record and triggers async AI processing.
      */
     public ImageUploadDto confirmDirectUpload(String gcsFileName, String originalFileName, String contentType,
