@@ -69,6 +69,16 @@ public class AssetEditSessionService {
                 .collect(Collectors.toList());
     }
 
+    /** Total logged editing time for this specific asset (upload row), across every user who's
+     *  ever opened it — the "Production Time" shown in the asset info panel to all users, not
+     *  just whoever is currently viewing it. */
+    @Transactional(readOnly = true)
+    public long getTotalProductionSeconds(Long assetId) {
+        return assetEditSessionRepository.findByImageUploadIdAndEndedAtIsNotNull(assetId).stream()
+                .mapToLong(s -> Math.max(Duration.between(s.getStartedAt(), s.getEndedAt()).getSeconds(), 0))
+                .sum();
+    }
+
     private Optional<AssetEditSession> openSessionFor(User user) {
         return assetEditSessionRepository.findFirstByUserIdAndEndedAtIsNullOrderByStartedAtDesc(user.getId());
     }

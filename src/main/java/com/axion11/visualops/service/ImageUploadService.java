@@ -55,6 +55,22 @@ public class ImageUploadService {
     @Value("${gemini.model}")
     private String geminiModel;
 
+    /** Forces ImageIO to (re-)scan for plugins under this class's own classloader. Spring Boot's
+     *  executable jar keeps dependency jars nested (BOOT-INF/lib/*.jar) and loads them through
+     *  its own classloader — ImageIO's SPI registry is a JVM-wide singleton that by default
+     *  populates itself from whichever classloader happens to be the thread context classloader
+     *  the first time it's touched, which isn't guaranteed to see nested-jar service providers.
+     *  Without this, TwelveMonkeys' PSD/TIFF ImageIO plugins (declared as regular Maven
+     *  dependencies) can silently fail to register, so getImageReaders() finds nothing for a
+     *  .psd/.tif file and preview generation does nothing — no exception, no log, just an
+     *  asset with no thumbnail. */
+    @jakarta.annotation.PostConstruct
+    void registerImageIOPlugins() {
+        Thread.currentThread().setContextClassLoader(getClass().getClassLoader());
+        ImageIO.scanForPlugins();
+        log.info("ImageIO plugins after scan: {}", String.join(", ", ImageIO.getReaderFormatNames()));
+    }
+
     /**
      * In-memory cache of face-group thumbnail bytes, keyed by GCS public URL. Populated lazily on
      * the first face-match call that needs each thumbnail and reused across subsequent calls so we
@@ -762,37 +778,98 @@ public class ImageUploadService {
     }
 
     /**
-     * Replaces an existing upload's file content in place — same row, same version number —
-     * instead of creating a new version row. Used by the desktop app's edit-and-resync flow: a
-     * local edit becomes draft + established (the current version an editor is working on), and
-     * the version number itself only advances when QC approves it (AssetService#approveAsset
-     * already advances-in-place on approval, so this keeps the same row-reuse pattern on the
-     * editing side too, instead of forking a new row on every save).
+     * Saves an editor's local edit-and-resync as the chain's "VE" (established) version — never
+     * v1, which stays untouched as the original source forever, and never a brand-new row on
+     * every single save either. The rule:
+     *   - If the chain already has an established version, this save replaces its content in
+     *     place (same row, same version number) — a second/third/... edit doesn't fork more rows.
+     *   - If the chain has no established version yet (the first edit), a new row is created,
+     *     one slot past the chain's current highest version number, and marked established.
+     * Either way the result is draft — the version number only actually advances when QC
+     * approves it (AssetService#approveAsset already advances-in-place on approval).
+     *
+     * @param anyIdInChain any version's id in the same chain as the edited asset (typically
+     *                     whichever version was open locally when the edit was saved)
      */
     @Transactional
-    public ImageUploadDto replaceContent(Long uploadId, String gcsFileName, String contentType, long fileSize) {
-        ImageUpload upload = imageUploadRepository.findById(uploadId)
-                .orElseThrow(() -> new NoSuchElementException("Upload not found: " + uploadId));
+    public ImageUploadDto syncEditedVersion(Long anyIdInChain, String gcsFileName, String contentType, long fileSize, String uploaderEmail) {
+        ImageUpload anchor = imageUploadRepository.findById(anyIdInChain)
+                .orElseThrow(() -> new NoSuchElementException("Upload not found: " + anyIdInChain));
 
-        upload.setGcsPath("gs://" + bucketName + "/" + gcsFileName);
-        upload.setPublicUrl("https://storage.googleapis.com/" + bucketName + "/" + gcsFileName);
-        // The old preview (if any) belonged to the pre-edit content — clear it so the UI falls
-        // back to the fresh publicUrl instead of showing a stale thumbnail of the old version.
-        upload.setPreviewUrl(null);
-        upload.setContentType(contentType);
-        upload.setFileSize(fileSize);
-        upload.setApprovalStatus("draft");
-        // The old automated QC result was for the pre-edit content — clear it so status
-        // resolution (which falls back to this when approvalStatus isn't an explicit
-        // approved/rejected/live) can't read a stale "PASSED" and show this fresh, unreviewed
-        // edit as already approved.
-        upload.setImageQualityQcCheck(null);
-        upload.setCreatedAt(LocalDateTime.now());
-        imageUploadRepository.save(upload);
+        String gcsPath = "gs://" + bucketName + "/" + gcsFileName;
+        String publicUrl = "https://storage.googleapis.com/" + bucketName + "/" + gcsFileName;
 
-        markEstablished(uploadId);
+        synchronized (versionLockFor(anchor.getFileName(), anchor.getBatch() != null ? anchor.getBatch().getId() : null)) {
+            List<ImageUpload> chain = resolveVersionChain(anchor.getId());
+            ImageUpload established = chain.stream().filter(ImageUpload::isEstablished).findFirst().orElse(null);
 
-        return getUpload(uploadId);
+            ImageUpload target;
+            if (established != null) {
+                // Second+ edit — update the existing VE row in place. v1 (and every other
+                // version in the chain) is never touched.
+                target = established;
+            } else {
+                // First edit — v1 stays untouched; the edit becomes a brand-new VE row instead
+                // of overwriting it.
+                ImageUpload v1 = chain.isEmpty() ? anchor : chain.get(0);
+                Long rootId = v1.getOriginalUploadId() != null ? v1.getOriginalUploadId() : v1.getId();
+                int nextVersion = chain.stream()
+                        .mapToInt(u -> u.getVersionNumber() != null ? u.getVersionNumber() : 1)
+                        .max().orElse(1) + 1;
+
+                User uploader = uploaderEmail != null ? userRepository.findByEmail(uploaderEmail).orElse(null) : null;
+                target = ImageUpload.builder()
+                        .fileName(v1.getFileName())
+                        .gcsPath(gcsPath)
+                        .publicUrl(publicUrl)
+                        .contentType(contentType)
+                        .fileSize(fileSize)
+                        .project(v1.getProject())
+                        .batch(v1.getBatch())
+                        .uploadedBy(uploader)
+                        .createdAt(LocalDateTime.now())
+                        .versionNumber(nextVersion)
+                        .originalUploadId(rootId)
+                        .uploadStatus("COMPLETED")
+                        .build();
+            }
+
+            target.setGcsPath(gcsPath);
+            target.setPublicUrl(publicUrl);
+            // Cleared up front in case preview regeneration below fails — better to fall back to
+            // the fresh publicUrl than keep showing a stale thumbnail of the pre-edit content.
+            target.setPreviewUrl(null);
+            target.setContentType(contentType);
+            target.setFileSize(fileSize);
+            target.setApprovalStatus("draft");
+            // The old automated QC result (if any) was for different content — clear it so
+            // status resolution (which falls back to this when approvalStatus isn't an explicit
+            // approved/rejected/live) can't read a stale "PASSED" and show this fresh,
+            // unreviewed edit as already approved.
+            target.setImageQualityQcCheck(null);
+            target = imageUploadRepository.save(target);
+
+            markEstablished(target.getId());
+
+            // Regenerate dimensions/preview from the actual new content — without this, formats
+            // the browser can't render directly (PSD, RAW, etc.) would have no thumbnail at all
+            // now that the stale one was cleared above. Downloading the bytes back from GCS here
+            // (server-to-server) rather than accepting them in this request is what keeps this
+            // endpoint's own request small — the desktop app already learned the hard way that a
+            // large multipart body here would hit Cloud Run's request-size limit.
+            if (contentType != null && contentType.startsWith("image/")) {
+                try {
+                    byte[] bytes = downloadFromGcs(gcsFileName);
+                    if (bytes != null) {
+                        extractAndSaveMetadata(target, bytes);
+                    }
+                } catch (Exception e) {
+                    log.warn("Preview regeneration failed for upload {}: {}", target.getId(), e.getMessage());
+                }
+            }
+
+            return getUpload(target.getId());
+        }
     }
 
     /**
@@ -1121,6 +1198,9 @@ public class ImageUploadService {
             javax.imageio.stream.ImageInputStream iis = javax.imageio.ImageIO.createImageInputStream(bais);
             if (iis != null) {
                 java.util.Iterator<javax.imageio.ImageReader> readers = javax.imageio.ImageIO.getImageReaders(iis);
+                if (!readers.hasNext()) {
+                    log.warn("No ImageIO reader found for {} — format plugin (e.g. TwelveMonkeys PSD/TIFF) may not be registered", imageUpload.getFileName());
+                }
                 if (readers.hasNext()) {
                     javax.imageio.ImageReader reader = readers.next();
                     reader.setInput(iis);

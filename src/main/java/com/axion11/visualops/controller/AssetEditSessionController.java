@@ -42,6 +42,16 @@ public class AssetEditSessionController {
         return ResponseEntity.ok(assetEditSessionService.getToday(user));
     }
 
+    /**
+     * GET /api/asset-edit-sessions/asset/{assetId}/total
+     * Total logged editing time for this asset across all users — powers the "Production Time"
+     * field in the asset info panel, visible to every user regardless of who did the editing.
+     */
+    @GetMapping("/asset/{assetId}/total")
+    public ResponseEntity<Map<String, Long>> assetTotal(@PathVariable("assetId") Long assetId) {
+        return ResponseEntity.ok(Map.of("totalSeconds", assetEditSessionService.getTotalProductionSeconds(assetId)));
+    }
+
     private Long parseAssetId(Map<String, String> body) {
         String raw = body.get("assetId");
         if (raw == null || raw.isBlank()) return null;

@@ -58,19 +58,22 @@ public class ImageUploadController {
 
     /**
      * POST /api/uploads/{id}/replace-content
-     * Replaces an existing upload's file in place — same row, same version number — instead of
-     * creating a new version. Used by the desktop app's edit-and-resync flow: an editor's save
-     * becomes draft + established (VE) on the version they were already working on; the version
-     * number itself only advances when QC approves it (see AssetController#approveAsset).
+     * Saves a local edit-and-resync as the chain's established (VE) version — updates the
+     * existing VE row in place if one exists, or creates it (as a new version past the chain's
+     * current highest) on the first edit. v1 is never overwritten. See
+     * ImageUploadService#syncEditedVersion for the full rule; the version number itself only
+     * advances when QC approves it (see AssetController#approveAsset).
      */
     @PostMapping("/{id}/replace-content")
     public ResponseEntity<ImageUploadDto> replaceContent(
             @PathVariable("id") Long id,
-            @RequestBody Map<String, Object> body) {
+            @RequestBody Map<String, Object> body,
+            @AuthenticationPrincipal UserDetails userDetails) {
         String gcsFileName = (String) body.get("gcsFileName");
         String contentType = (String) body.get("contentType");
         long fileSize = ((Number) body.get("fileSize")).longValue();
-        ImageUploadDto result = imageUploadService.replaceContent(id, gcsFileName, contentType, fileSize);
+        String uploaderEmail = userDetails != null ? userDetails.getUsername() : null;
+        ImageUploadDto result = imageUploadService.syncEditedVersion(id, gcsFileName, contentType, fileSize, uploaderEmail);
         return ResponseEntity.ok(result);
     }
 

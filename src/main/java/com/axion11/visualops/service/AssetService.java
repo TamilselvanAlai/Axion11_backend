@@ -134,6 +134,11 @@ public class AssetService {
                 .map(v1 -> v1.getVersionNumber() != null ? v1.getVersionNumber() : 1)
                 .orElse(1);
         for (ImageUpload sibling : imageUploadRepository.findByOriginalUploadIdOrderByVersionNumberAsc(rootId)) {
+            // Exclude the row being approved from its own "max so far" — a VE row already holds
+            // a provisional number from when it was created (ImageUploadService#syncEditedVersion
+            // assigns one immediately so the chain sorts correctly while still in draft), and
+            // counting that against itself here would inflate v1->v2 into v1->v3 on approval.
+            if (sibling.getId().equals(upload.getId())) continue;
             int v = sibling.getVersionNumber() != null ? sibling.getVersionNumber() : 1;
             if (v > maxVersion) maxVersion = v;
         }

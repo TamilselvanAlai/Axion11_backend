@@ -14,4 +14,6 @@ public interface AssetEditSessionRepository extends JpaRepository<AssetEditSessi
 
     List<AssetEditSession> findByUserIdAndStartedAtBetweenAndEndedAtIsNotNullOrderByEndedAtDesc(
             Long userId, LocalDateTime start, LocalDateTime end);
+
+    List<AssetEditSession> findByImageUploadIdAndEndedAtIsNotNull(Long imageUploadId);
 }
