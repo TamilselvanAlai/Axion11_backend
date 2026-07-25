@@ -94,6 +94,7 @@ public class BatchService {
         // totalImages and uploadStatus are set by the start-upload endpoint before chunks arrive.
 
         AtomicInteger uploaded = new AtomicInteger(0);
+        AtomicInteger failed = new AtomicInteger(0);
         AtomicBoolean hasFailure = new AtomicBoolean(false);
         Long projectId = batch.getProject().getId();
 
@@ -152,6 +153,7 @@ public class BatchService {
                 } catch (Exception e) {
                     log.error("Failed to upload file {} for batch {}: {}", fileData.originalFilename(), batchId, e.getMessage(), e);
                     hasFailure.set(true);
+                    failed.incrementAndGet();
                 } finally {
                     // Clean up temp file
                     if (fileData.tempFile() != null) {
@@ -174,9 +176,16 @@ public class BatchService {
         // Atomically mark COMPLETED only if all images across all chunks are done.
         // Uses a DB-level WHERE check to avoid Hibernate L1 cache staleness.
         int finalUploaded = uploaded.get();
+        int finalFailed = failed.get();
         if (hasFailure.get() && finalUploaded == 0) {
             batchRepository.updateStatuses(batchId, "FAILED", "FAILED");
         } else {
+            // Files that permanently failed this chunk will never increment uploadedImages —
+            // drop them from the expected total so the batch can still reach COMPLETED instead
+            // of polling forever waiting for uploadedImages to reach an unreachable totalImages.
+            if (finalFailed > 0) {
+                batchRepository.decrementTotalImages(batchId, finalFailed);
+            }
             batchRepository.completeIfAllUploaded(batchId);
         }
 

@@ -49,6 +49,13 @@ public interface BatchRepository extends JpaRepository<Batch, Long> {
     @Query("UPDATE Batch b SET b.uploadStatus = 'COMPLETED', b.status = 'ACTIVE' WHERE b.id = :batchId AND b.uploadedImages >= b.totalImages AND b.totalImages > 0")
     int completeIfAllUploaded(@Param("batchId") Long batchId);
 
+    /** Drops permanently-failed files out of the expected total so a partial failure doesn't
+     *  leave the batch stuck below totalImages forever (see completeIfAllUploaded). */
+    @Modifying
+    @Transactional
+    @Query("UPDATE Batch b SET b.totalImages = b.totalImages - :count WHERE b.id = :batchId")
+    void decrementTotalImages(@Param("batchId") Long batchId, @Param("count") int count);
+
     /** Reset upload counters for a new upload session. */
     @Modifying
     @Transactional
