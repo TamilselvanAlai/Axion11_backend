@@ -704,10 +704,16 @@ public class ImageUploadService {
      * either because they were uploaded before preview generation existed, or because the
      * original generation attempt failed. Re-downloads each file and re-runs the same
      * extraction pipeline used on upload.
+     *
+     * Capped at {@code limit} candidates per call — decoding a large PSD/TIFF into a
+     * BufferedImage can use hundreds of MB of heap, and running the whole backlog in one
+     * request risked an OutOfMemoryError. Callers should keep invoking this until it returns
+     * fewer than {@code limit} updates (or a 0-candidate response) to drain the full backlog.
      */
-    public int backfillPreviews() {
+    public int backfillPreviews(int limit) {
         List<ImageUpload> candidates = imageUploadRepository.findByPreviewUrlIsNull().stream()
                 .filter(u -> needsPreview(u.getFileName()) || isVideoPreview(u.getFileName()))
+                .limit(Math.max(1, limit))
                 .toList();
 
         java.net.http.HttpClient httpClient = java.net.http.HttpClient.newHttpClient();

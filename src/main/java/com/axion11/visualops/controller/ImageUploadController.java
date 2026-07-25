@@ -243,8 +243,8 @@ public class ImageUploadController {
      * before preview generation existed, or whose original generation attempt failed).
      */
     @PostMapping("/backfill-previews")
-    public ResponseEntity<String> backfillPreviews() {
-        int updated = imageUploadService.backfillPreviews();
+    public ResponseEntity<String> backfillPreviews(@RequestParam(value = "limit", defaultValue = "15") int limit) {
+        int updated = imageUploadService.backfillPreviews(limit);
         return ResponseEntity.ok("Generated previews for " + updated + " uploads");
     }
 
