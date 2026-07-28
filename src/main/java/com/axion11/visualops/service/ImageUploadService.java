@@ -845,6 +845,10 @@ public class ImageUploadService {
             // Cleared up front in case preview regeneration below fails — better to fall back to
             // the fresh publicUrl than keep showing a stale thumbnail of the pre-edit content.
             target.setPreviewUrl(null);
+            // An editor save-as can change the format (e.g. JPG -> TIFF) without touching the
+            // file name otherwise — keep the extension truthful, since needsPreview() below (and
+            // the desktop app's own file-type fallback) both read it off the name.
+            target.setFileName(renameExtensionForContentType(target.getFileName(), contentType));
             target.setContentType(contentType);
             target.setFileSize(fileSize);
             target.setApprovalStatus("draft");
@@ -1276,6 +1280,39 @@ public class ImageUploadService {
     }
 
     // ── Preview generation ─────────────────────────────────────────────────────
+
+    /** Content types recognized well enough to rewrite a file name's extension for. */
+    private static final Map<String, String> CONTENT_TYPE_EXTENSIONS = Map.ofEntries(
+            Map.entry("image/tiff", "tiff"),
+            Map.entry("image/jpeg", "jpg"),
+            Map.entry("image/jpg", "jpg"),
+            Map.entry("image/png", "png"),
+            Map.entry("image/webp", "webp"),
+            Map.entry("image/vnd.adobe.photoshop", "psd"),
+            Map.entry("application/x-photoshop", "psd"),
+            Map.entry("image/x-canon-cr3", "cr3")
+    );
+
+    /**
+     * Swaps a file name's extension to match its actual content type — used when an edit save
+     * changes format (e.g. JPG -> TIFF) so the stored name doesn't keep lying about what the
+     * bytes actually are. Unrecognized content types are left alone rather than guessed at.
+     */
+    private String renameExtensionForContentType(String fileName, String contentType) {
+        if (fileName == null || contentType == null) return fileName;
+        String newExt = CONTENT_TYPE_EXTENSIONS.get(contentType.toLowerCase());
+        if (newExt == null) return fileName;
+
+        int dot = fileName.lastIndexOf('.');
+        String currentExt = dot >= 0 ? fileName.substring(dot + 1).toLowerCase() : "";
+        boolean alreadyEquivalent = currentExt.equals(newExt)
+                || (newExt.equals("jpg") && currentExt.equals("jpeg"))
+                || (newExt.equals("tiff") && currentExt.equals("tif"));
+        if (alreadyEquivalent) return fileName;
+
+        String base = dot >= 0 ? fileName.substring(0, dot) : fileName;
+        return base + "." + newExt;
+    }
 
     /** Extensions that browsers cannot render natively — need a JPEG preview. */
     private static final Set<String> NEEDS_PREVIEW_EXTS = Set.of(

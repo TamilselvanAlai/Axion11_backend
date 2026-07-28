@@ -369,18 +369,26 @@ public class BatchService {
         return toDto(batch);
     }
 
+    /**
+     * List variant used by the folder-browser (desktop app filters this down to a single
+     * parent's direct children client-side) — {@link #toDto} would hydrate every ImageUpload
+     * (plus tags) for every batch in the project just to populate a nested field callers here
+     * never read, so this uses the minimal mapping instead. {@code totalImages} is still
+     * accurate: it's a running counter maintained by dedicated update queries (see
+     * BatchRepository#addTotalImagesAndSetStatus etc.), not derived from the upload rows.
+     */
     public List<BatchDto> getBatchesByProject(Long projectId) {
         java.util.Set<Long> allowed = projectAccessService.allowedProjectIds();
         if (projectId != null) {
             if (allowed != null && !allowed.contains(projectId)) return List.of();
             return batchRepository.findByProjectId(projectId).stream()
-                    .map(this::toDto).collect(Collectors.toList());
+                    .map(this::toBatchDtoMinimal).collect(Collectors.toList());
         }
         java.util.stream.Stream<Batch> stream = batchRepository.findAll().stream();
         if (allowed != null) {
             stream = stream.filter(b -> b.getProject() != null && allowed.contains(b.getProject().getId()));
         }
-        return stream.map(this::toDto).collect(Collectors.toList());
+        return stream.map(this::toBatchDtoMinimal).collect(Collectors.toList());
     }
 
     public BatchDto toBatchDtoMinimal(Batch batch) {
