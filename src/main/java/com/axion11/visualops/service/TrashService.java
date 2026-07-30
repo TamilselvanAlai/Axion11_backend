@@ -1,6 +1,7 @@
 package com.axion11.visualops.service;
 
 import com.axion11.visualops.models.ImageUpload;
+import com.axion11.visualops.repository.AssetEditSessionRepository;
 import com.axion11.visualops.repository.BatchRepository;
 import com.axion11.visualops.repository.CommentRepository;
 import com.axion11.visualops.repository.ImageQcResultRepository;
@@ -34,6 +35,7 @@ public class TrashService {
     private final ImageTagRepository imageTagRepository;
     private final CommentRepository commentRepository;
     private final SyncedFileRepository syncedFileRepository;
+    private final AssetEditSessionRepository assetEditSessionRepository;
     private final EntityManager entityManager;
 
     @Value("${gcs.bucket.name}")
@@ -130,6 +132,7 @@ public class TrashService {
         imageQcResultRepository.deleteByImageUploadId(id);
         imageTagRepository.deleteByImageUploadId(id);
         commentRepository.deleteByImageUploadId(id);
+        assetEditSessionRepository.deleteByImageUploadId(id);
         syncedFileRepository.orphanByImageUploadIds(List.of(id));
         imageUploadRepository.hardDeleteById(id);
     }
@@ -162,11 +165,14 @@ public class TrashService {
             imageQcResultRepository.deleteByImageUploadIdIn(uploadIds);
             imageTagRepository.deleteByImageUploadIdIn(uploadIds);
             commentRepository.deleteByImageUploadIdIn(uploadIds);
+            assetEditSessionRepository.deleteByImageUploadIdIn(uploadIds);
             syncedFileRepository.orphanByImageUploadIds(uploadIds);
         }
-        // Delete uploads then batch
+        // Delete uploads then batch. hardDeleteById bypasses @SQLRestriction — plain deleteById()
+        // silently no-ops for a batch that's already soft-deleted (its own findById() can't see
+        // the row), which is exactly the state every batch reaching this point is normally in.
         imageUploadRepository.deleteAllByBatchId(id);
-        batchRepository.deleteById(id);
+        batchRepository.hardDeleteById(id);
     }
 
     @Transactional

@@ -9,6 +9,7 @@ import org.springframework.data.repository.query.Param;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 
@@ -92,6 +93,16 @@ public interface ImageUploadRepository extends JpaRepository<ImageUpload, Long> 
     @Query(value = "DELETE FROM image_uploads WHERE deleted_at IS NOT NULL AND deleted_at < :cutoff", nativeQuery = true)
     void hardDeleteOlderThan(@Param("cutoff") LocalDateTime cutoff);
 
+    /** Hard-deletes uploads by id regardless of deleted_at state — used when permanently
+     *  deleting a whole project, where both active and already-trashed standalone uploads need
+     *  to go. Bypasses @SQLRestriction (native SQL) so it can't silently no-op on trashed rows
+     *  the way a plain deleteAllById() would. Callers must have already cleared any FK-referencing
+     *  child rows (tags/comments/QC results/edit sessions) for these ids first. */
+    @Modifying
+    @Transactional
+    @Query(value = "DELETE FROM image_uploads WHERE id IN :ids", nativeQuery = true)
+    void hardDeleteAllByIdIn(@Param("ids") Collection<Long> ids);
+
     @Query(value = "SELECT id, gcs_path, public_url FROM image_uploads WHERE deleted_at IS NOT NULL", nativeQuery = true)
     List<Object[]> findTrashGcsPaths();
 
@@ -111,4 +122,11 @@ public interface ImageUploadRepository extends JpaRepository<ImageUpload, Long> 
     /** Find ALL uploads (including soft-deleted) for a batch, for use in trash permanent delete. */
     @Query(value = "SELECT * FROM image_uploads WHERE batch_id = :batchId", nativeQuery = true)
     List<ImageUpload> findAllByBatchIdIncludingDeleted(@Param("batchId") Long batchId);
+
+    /** Find ALL uploads (including soft-deleted) attached directly to a project, for use when
+     *  permanently deleting the whole project — a plain findByProjectId respects @SQLRestriction
+     *  and silently misses any already-trashed upload, leaving its row behind to block the
+     *  project's own delete with a dangling FK. */
+    @Query(value = "SELECT * FROM image_uploads WHERE project_id = :projectId", nativeQuery = true)
+    List<ImageUpload> findAllByProjectIdIncludingDeleted(@Param("projectId") Long projectId);
 }

@@ -8,8 +8,13 @@ import com.axion11.visualops.models.User;
 import com.axion11.visualops.models.dto.ProjectDto;
 import com.axion11.visualops.models.dto.ProjectRequest;
 import com.axion11.visualops.models.Team;
+import com.axion11.visualops.models.Batch;
+import com.axion11.visualops.repository.AssetEditSessionRepository;
+import com.axion11.visualops.repository.BatchRepository;
+import com.axion11.visualops.repository.CommentRepository;
 import com.axion11.visualops.repository.FaceGroupRepository;
 import com.axion11.visualops.repository.ImageQcResultRepository;
+import com.axion11.visualops.repository.ImageTagRepository;
 import com.axion11.visualops.repository.ImageUploadRepository;
 import com.axion11.visualops.repository.ProjectRepository;
 import com.axion11.visualops.repository.SyncedFileRepository;
@@ -19,6 +24,7 @@ import com.axion11.visualops.repository.UserRepository;
 import com.google.cloud.storage.BlobId;
 import com.google.cloud.storage.Storage;
 import com.google.cloud.storage.StorageOptions;
+import jakarta.persistence.EntityManager;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -44,6 +50,12 @@ public class ProjectService {
     private final FaceGroupRepository faceGroupRepository;
     private final TeamRepository teamRepository;
     private final ProjectAccessService projectAccessService;
+    private final BatchRepository batchRepository;
+    private final TrashService trashService;
+    private final ImageTagRepository imageTagRepository;
+    private final CommentRepository commentRepository;
+    private final AssetEditSessionRepository assetEditSessionRepository;
+    private final EntityManager entityManager;
 
     @Value("${gcs.bucket.name}")
     private String bucketName;
@@ -131,8 +143,20 @@ public class ProjectService {
             return false;
         }
 
-        List<ImageUpload> uploads = imageUploadRepository.findByProjectIdOrderByCreatedAtDesc(id);
+        // Includes soft-deleted (trashed) uploads too — a plain findByProjectId respects
+        // ImageUpload's own @SQLRestriction and would silently miss any of those, leaving their
+        // row behind to block the project's own delete with a dangling FK.
+        List<ImageUpload> uploads = imageUploadRepository.findAllByProjectIdIncludingDeleted(id);
         List<Long> uploadIds = uploads.stream().map(ImageUpload::getId).collect(Collectors.toList());
+        // Uploads attached directly to the project (no batch) have no other cascade path to get
+        // removed at all — Project has no imageUploads collection, only a batches one — so their
+        // rows get explicitly deleted below. Batch-linked uploads are left for step 6, which
+        // deletes them together with their batch. Read this off the entity now, before the
+        // entityManager.clear() below detaches it.
+        List<Long> standaloneUploadIds = uploads.stream()
+                .filter(u -> u.getBatch() == null)
+                .map(ImageUpload::getId)
+                .collect(Collectors.toList());
 
         // 1) Delete the GCS objects backing these uploads (best-effort).
         if (!uploads.isEmpty()) {
@@ -151,11 +175,32 @@ public class ProjectService {
             }
         }
 
+        // The uploads fetched above (and their eagerly-joined tags/batch/project) are now
+        // managed entities sitting in this transaction's persistence context. Every step from
+        // here on deletes rows out from under them with bulk/native queries (this repository's
+        // own calls, and TrashService's), which the persistence context has no way to know
+        // about. Left alone, Hibernate tries to redundantly cascade those same rows again at
+        // final flush/commit — surfacing as "unsaved transient instance" or "unexpected row
+        // count" errors on entities that were, in fact, already deleted correctly. Clearing here
+        // detaches everything loaded so far so the rest of this method only ever deals with the
+        // database's actual current state.
+        entityManager.flush();
+        entityManager.clear();
+
         // 2) Detach SyncedFile rows pointing at these uploads (mark ORPHANED, keep cloud-connection metadata).
         if (!uploadIds.isEmpty()) {
             syncedFileRepository.orphanByImageUploadIds(uploadIds);
-            // 3) Delete ImageQcResult rows that reference these uploads (no cascade from ImageUpload).
+            // 3) Delete ImageQcResult/tag/comment/edit-session rows that reference these uploads
+            // (no cascade from ImageUpload for these — same reasoning as TrashService's
+            // permanent-delete flow).
             imageQcResultRepository.deleteByImageUploadIdIn(uploadIds);
+            imageTagRepository.deleteByImageUploadIdIn(uploadIds);
+            commentRepository.deleteByImageUploadIdIn(uploadIds);
+            assetEditSessionRepository.deleteByImageUploadIdIn(uploadIds);
+
+            if (!standaloneUploadIds.isEmpty()) {
+                imageUploadRepository.hardDeleteAllByIdIn(standaloneUploadIds);
+            }
         }
 
         // 4) Delete tasks for this project (cascades subtasks via Task @OneToMany cascade ALL).
@@ -166,9 +211,32 @@ public class ProjectService {
         List<FaceGroup> faceGroups = faceGroupRepository.findByProjectId(id);
         if (!faceGroups.isEmpty()) faceGroupRepository.deleteAll(faceGroups);
 
-        // 6) Finally delete the project — cascades to batches → image_uploads → comments/tags/assets.
-        projectRepository.delete(project);
-        log.info("Deleted project {} (uploads={}, tasks={}, faceGroups={})", id, uploads.size(), tasks.size(), faceGroups.size());
+        // 6) Delete every batch under this project (recursively, including sub-batches, their
+        // uploads, tags, comments, QC results and GCS objects) via the same routine the trash
+        // flow already uses. The Project→Batch JPA cascade looks like it should handle this on
+        // its own, but in practice it doesn't reliably fire — the project row's own DELETE was
+        // failing with a batches→projects FK violation because no batch had been removed yet.
+        // findRootBatchIdsByProjectId includes soft-deleted batches too, so none get left behind
+        // pointing at a project that's about to disappear.
+        List<Long> rootBatchIds = batchRepository.findRootBatchIdsByProjectId(id);
+        for (Long batchId : rootBatchIds) {
+            trashService.permanentDeleteBatch(batchId);
+            // Flush+clear after each batch so entities it loaded/removed don't linger into the
+            // next batch's (or the final project delete's) processing — see the comment above
+            // the first clear() in this method for why that matters here.
+            entityManager.flush();
+            entityManager.clear();
+        }
+
+        // 7) Finally delete the project itself. Re-fetch it fresh — the entityManager.clear()
+        // above detached the `project` reference fetched at the top of this method.
+        entityManager.flush();
+        entityManager.clear();
+        Project freshProject = projectRepository.findById(id)
+                .orElseThrow(() -> new IllegalStateException("Project " + id + " vanished mid-delete"));
+        projectRepository.delete(freshProject);
+        log.info("Deleted project {} (uploads={}, tasks={}, faceGroups={}, rootBatches={})",
+                id, uploads.size(), tasks.size(), faceGroups.size(), rootBatchIds.size());
         return true;
     }
 

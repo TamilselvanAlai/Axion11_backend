@@ -79,6 +79,21 @@ public interface BatchRepository extends JpaRepository<Batch, Long> {
     @Query(value = "SELECT id FROM batches WHERE parent_batch_id = :parentId", nativeQuery = true)
     List<Long> findChildIdsByParentId(@Param("parentId") Long parentId);
 
+    /** Root-level batch ids for a project, including soft-deleted ones (bypasses
+     *  @SQLRestriction via native SQL) — used when permanently deleting a whole project, so no
+     *  batch (trashed or not) is left behind referencing the now-gone project. */
+    @Query(value = "SELECT id FROM batches WHERE project_id = :projectId AND parent_batch_id IS NULL", nativeQuery = true)
+    List<Long> findRootBatchIdsByProjectId(@Param("projectId") Long projectId);
+
+    /** Hard-deletes a batch row regardless of its deleted_at state (bypasses @SQLRestriction via
+     *  native SQL) — plain deleteById() silently no-ops for an already-soft-deleted batch, since
+     *  its own findById() can't see the row to delete it, leaving it behind forever. Used by the
+     *  permanent-delete flow (TrashService), which operates on already-trashed batches. */
+    @Modifying
+    @Transactional
+    @Query(value = "DELETE FROM batches WHERE id = :id", nativeQuery = true)
+    void hardDeleteById(@Param("id") Long id);
+
     /** Name lookup that bypasses @SQLRestriction — needed because an upload's batch may itself be soft-deleted. */
     @Query(value = "SELECT name FROM batches WHERE id = :id", nativeQuery = true)
     Optional<String> findNameById(@Param("id") Long id);
