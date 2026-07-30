@@ -60,6 +60,17 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
         if (StringUtils.hasText(bearerToken) && bearerToken.startsWith("Bearer ")) {
             return bearerToken.substring(7);
         }
+
+        // EventSource (used for the SSE batch-status stream) can't set a custom Authorization
+        // header, so accept the token as a query param — but only for that one path, so every
+        // other endpoint still requires the header.
+        if (request.getRequestURI().endsWith("/stream")) {
+            String queryToken = request.getParameter("token");
+            if (StringUtils.hasText(queryToken)) {
+                return queryToken;
+            }
+        }
+
         return null;
     }
 }

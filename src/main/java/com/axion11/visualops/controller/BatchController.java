@@ -4,16 +4,19 @@ import com.axion11.visualops.controller.dto.BatchDto;
 import com.axion11.visualops.controller.dto.BatchRequest;
 import com.axion11.visualops.controller.dto.ImageUploadDto;
 import com.axion11.visualops.repository.BatchRepository;
+import com.axion11.visualops.service.BatchEventService;
 import com.axion11.visualops.service.BatchService;
 import com.axion11.visualops.service.BatchService.FileData;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.security.core.userdetails.UserDetails;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -27,6 +30,7 @@ public class BatchController {
 
     private final BatchService batchService;
     private final BatchRepository batchRepository;
+    private final BatchEventService batchEventService;
 
     /**
      * POST /api/batches
@@ -100,6 +104,17 @@ public class BatchController {
     }
 
     /**
+     * GET /api/batches/{id}/stream
+     * Pushes upload-status changes for this batch over SSE — replaces the old client-side
+     * fixed-interval poll of getBatch(). Auth token is accepted as a query param here (see
+     * JwtAuthenticationFilter) since EventSource can't set an Authorization header.
+     */
+    @GetMapping(value = "/{id}/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter streamBatchStatus(@PathVariable("id") Long id) {
+        return batchEventService.subscribe(id);
+    }
+
+    /**
      * GET /api/batches?projectId=...
      * Returns all batches, optionally filtered by project.
      */
@@ -130,6 +145,7 @@ public class BatchController {
         if (total == 0) {
             // No files to upload — mark as completed immediately
             batchRepository.updateStatuses(id, "COMPLETED", "ACTIVE");
+            batchEventService.publishStatus(id, "COMPLETED");
         } else {
             batchRepository.resetUploadProgress(id, total);
         }

@@ -50,6 +50,7 @@ public class BatchService {
     private final ExecutorService imageUploadExecutor;
     private final ExecutorService aiAnalysisExecutor;
     private final ProjectAccessService projectAccessService;
+    private final BatchEventService batchEventService;
 
     /**
      * Creates a batch record and returns it immediately.
@@ -179,6 +180,7 @@ public class BatchService {
         int finalFailed = failed.get();
         if (hasFailure.get() && finalUploaded == 0) {
             batchRepository.updateStatuses(batchId, "FAILED", "FAILED");
+            batchEventService.publishStatus(batchId, "FAILED");
         } else {
             // Files that permanently failed this chunk will never increment uploadedImages —
             // drop them from the expected total so the batch can still reach COMPLETED instead
@@ -186,7 +188,12 @@ public class BatchService {
             if (finalFailed > 0) {
                 batchRepository.decrementTotalImages(batchId, finalFailed);
             }
-            batchRepository.completeIfAllUploaded(batchId);
+            // Only push COMPLETED when this call is the one that actually flipped it (>0 rows) —
+            // uploadImagesAsync can run several times concurrently for the same batch (chunked
+            // uploads), and every chunk reaches this line regardless of whether it was the last one.
+            if (batchRepository.completeIfAllUploaded(batchId) > 0) {
+                batchEventService.publishStatus(batchId, "COMPLETED");
+            }
         }
 
         log.info("Batch {} chunk complete: {}/{} images. Starting deferred AI analysis...",
