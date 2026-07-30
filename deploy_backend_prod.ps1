@@ -14,14 +14,18 @@ $SEED_DEMO_DATA = "false"
 
 # Secrets are read from the environment — set them (or `. .\env.deploy.ps1`, a local,
 # gitignored script) before running this. See .env.deploy.example.
-foreach ($name in "DB_PASSWORD", "JWT_SECRET", "GEMINI_API_KEY", "GOOGLE_DRIVE_CLIENT_SECRET") {
+#
+# GEMINI_API_KEY is deliberately NOT in this list: it's left out of the deploy payload
+# entirely below (and out of $ownedKeys, so it instead flows through the generic .env
+# forwarding loop, which already skips blank values) so a blank/missing local value can
+# never overwrite whatever key is already live on the Cloud Run service.
+foreach ($name in "DB_PASSWORD", "JWT_SECRET", "GOOGLE_DRIVE_CLIENT_SECRET") {
     if (-not (Get-Item "env:$name" -ErrorAction SilentlyContinue)) {
         throw "Set `$env:$name before running this script"
     }
 }
 $DB_PASSWORD = $env:DB_PASSWORD
 $JWT_SECRET = $env:JWT_SECRET
-$GEMINI_API_KEY = $env:GEMINI_API_KEY
 $GOOGLE_DRIVE_CLIENT_SECRET = $env:GOOGLE_DRIVE_CLIENT_SECRET
 
 $INSTANCE_CONNECTION_NAME = "${PROJECT_ID}:${REGION}:${DB_INSTANCE_NAME}"
@@ -68,8 +72,8 @@ Write-Host "--> Deploying Backend to Cloud Run..."
 $unixTime = [int][datetime]::UtcNow.Subtract((New-Object datetime 1970, 1, 1)).TotalSeconds
 
 # Vars this script computes/owns directly (order matches the historical hardcoded list).
-$envVars = "SERVER_PORT=8080|DB_URL=jdbc:mysql:///${DB_NAME}?cloudSqlInstance=${INSTANCE_CONNECTION_NAME}&socketFactory=com.google.cloud.sql.mysql.SocketFactory&useSSL=false|DB_USER=${DB_USER}|DB_PASSWORD=${DB_PASSWORD}|JWT_SECRET=${JWT_SECRET}|JWT_EXPIRATION=86400000|CORS_ORIGINS=${CORS_ORIGINS}|FRONTEND_URL=${FRONTEND_URL}|GCS_BUCKET_NAME=${GCS_BUCKET_NAME}|GEMINI_API_KEY=${GEMINI_API_KEY}|GOOGLE_DRIVE_CLIENT_ID=${GOOGLE_DRIVE_CLIENT_ID}|GOOGLE_DRIVE_CLIENT_SECRET=${GOOGLE_DRIVE_CLIENT_SECRET}|GOOGLE_SIGNIN_REDIRECT_URI=${GOOGLE_SIGNIN_REDIRECT_URI}|SEED_DEMO_DATA=${SEED_DEMO_DATA}"
-$ownedKeys = @("SERVER_PORT","DB_URL","DB_USER","DB_PASSWORD","JWT_SECRET","JWT_EXPIRATION","CORS_ORIGINS","FRONTEND_URL","GCS_BUCKET_NAME","GEMINI_API_KEY","GOOGLE_DRIVE_CLIENT_ID","GOOGLE_DRIVE_CLIENT_SECRET","GOOGLE_SIGNIN_REDIRECT_URI","SEED_DEMO_DATA")
+$envVars = "SERVER_PORT=8080|DB_URL=jdbc:mysql:///${DB_NAME}?cloudSqlInstance=${INSTANCE_CONNECTION_NAME}&socketFactory=com.google.cloud.sql.mysql.SocketFactory&useSSL=false|DB_USER=${DB_USER}|DB_PASSWORD=${DB_PASSWORD}|JWT_SECRET=${JWT_SECRET}|JWT_EXPIRATION=86400000|CORS_ORIGINS=${CORS_ORIGINS}|FRONTEND_URL=${FRONTEND_URL}|GCS_BUCKET_NAME=${GCS_BUCKET_NAME}|GOOGLE_DRIVE_CLIENT_ID=${GOOGLE_DRIVE_CLIENT_ID}|GOOGLE_DRIVE_CLIENT_SECRET=${GOOGLE_DRIVE_CLIENT_SECRET}|GOOGLE_SIGNIN_REDIRECT_URI=${GOOGLE_SIGNIN_REDIRECT_URI}|SEED_DEMO_DATA=${SEED_DEMO_DATA}"
+$ownedKeys = @("SERVER_PORT","DB_URL","DB_USER","DB_PASSWORD","JWT_SECRET","JWT_EXPIRATION","CORS_ORIGINS","FRONTEND_URL","GCS_BUCKET_NAME","GOOGLE_DRIVE_CLIENT_ID","GOOGLE_DRIVE_CLIENT_SECRET","GOOGLE_SIGNIN_REDIRECT_URI","SEED_DEMO_DATA")
 
 # Forward every other var defined in .env verbatim (Google desktop client id, mail, OneDrive,
 # etc.) so new config only ever needs to be added in one place instead of being hand-copied
@@ -91,11 +95,11 @@ gcloud run deploy axion11-backend `
     --region $REGION `
     --project $PROJECT_ID `
     --allow-unauthenticated `
-    --memory 4Gi `
+    --memory 8Gi `
     --cpu 2 `
     --timeout 600 `
     --execution-environment gen2 `
-    --set-env-vars "^|^${envVars}" `
+    --update-env-vars "^|^${envVars}" `
     --add-cloudsql-instances ${INSTANCE_CONNECTION_NAME} `
     --revision-suffix="$unixTime"
 

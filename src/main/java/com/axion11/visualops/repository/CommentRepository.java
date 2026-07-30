@@ -16,6 +16,11 @@ public interface CommentRepository extends JpaRepository<Comment, Long> {
     List<Comment> findByAssetId(Long assetId);
     List<Comment> findByImageUploadId(Long imageUploadId);
 
+    /** One grouped query for a set of uploads' comment counts, instead of loading each
+     *  upload's lazy comments collection one row at a time (N+1) — see ProjectTreeService. */
+    @Query("SELECT c.imageUpload.id, COUNT(c) FROM Comment c WHERE c.imageUpload.id IN :imageUploadIds GROUP BY c.imageUpload.id")
+    List<Object[]> countGroupedByImageUploadIdIn(@Param("imageUploadIds") Collection<Long> imageUploadIds);
+
     // Explicit bulk JPQL DELETE (not a derived deleteBy... method) so it executes immediately
     // via executeUpdate() — see ImageTagRepository for why a derived delete here is unsafe when
     // a native SQL delete on image_uploads runs afterwards in the same transaction.

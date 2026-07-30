@@ -5,6 +5,7 @@ import com.axion11.visualops.models.ImageUpload;
 import com.axion11.visualops.models.Project;
 import com.axion11.visualops.models.dto.ProjectTreeNode;
 import com.axion11.visualops.repository.BatchRepository;
+import com.axion11.visualops.repository.CommentRepository;
 import com.axion11.visualops.repository.ImageUploadRepository;
 import com.axion11.visualops.repository.ProjectRepository;
 import lombok.RequiredArgsConstructor;
@@ -12,7 +13,9 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 @Service
@@ -23,6 +26,7 @@ public class ProjectTreeService {
     private final ProjectRepository projectRepository;
     private final BatchRepository batchRepository;
     private final ImageUploadRepository imageUploadRepository;
+    private final CommentRepository commentRepository;
     private final ProjectAccessService projectAccessService;
 
     public List<ProjectTreeNode> getProjectTree() {
@@ -34,10 +38,41 @@ public class ProjectTreeService {
         return stream.map(this::mapProject).collect(Collectors.toList());
     }
 
+    /**
+     * Builds one project's tree from a handful of bulk queries (all batches, all uploads, all
+     * comment counts for the project) instead of the previous recursive per-batch/per-asset
+     * queries, which scaled with tree size (O(batches + assets) sequential DB round trips) and
+     * could make this endpoint slow enough to blow past the frontend's request timeout on large
+     * projects.
+     */
     private ProjectTreeNode mapProject(Project project) {
-        List<ProjectTreeNode> batchNodes = batchRepository
-                .findByProjectIdAndParentBatchIsNull(project.getId()).stream()
-                .map(b -> mapBatch(b, project))
+        List<Batch> allBatches = batchRepository.findByProjectId(project.getId());
+        List<ImageUpload> allUploads = imageUploadRepository.findByProjectIdOrderByCreatedAtDesc(project.getId());
+
+        Map<Long, List<Batch>> batchesByParentId = new HashMap<>();
+        for (Batch b : allBatches) {
+            Long parentId = b.getParentBatch() != null ? b.getParentBatch().getId() : null;
+            batchesByParentId.computeIfAbsent(parentId, k -> new ArrayList<>()).add(b);
+        }
+
+        Map<Long, List<ImageUpload>> uploadsByBatchId = new HashMap<>();
+        List<Long> uploadIds = new ArrayList<>();
+        for (ImageUpload u : allUploads) {
+            uploadIds.add(u.getId());
+            if (u.getBatch() != null) {
+                uploadsByBatchId.computeIfAbsent(u.getBatch().getId(), k -> new ArrayList<>()).add(u);
+            }
+        }
+
+        Map<Long, Long> commentCountByUploadId = new HashMap<>();
+        if (!uploadIds.isEmpty()) {
+            for (Object[] row : commentRepository.countGroupedByImageUploadIdIn(uploadIds)) {
+                commentCountByUploadId.put((Long) row[0], (Long) row[1]);
+            }
+        }
+
+        List<ProjectTreeNode> batchNodes = batchesByParentId.getOrDefault(null, List.of()).stream()
+                .map(b -> mapBatch(b, project, batchesByParentId, uploadsByBatchId, commentCountByUploadId))
                 .collect(Collectors.toList());
 
         int totalApproved = batchNodes.stream().mapToInt(b -> b.getApprovedCount() != null ? b.getApprovedCount() : 0).sum();
@@ -58,8 +93,14 @@ public class ProjectTreeService {
                 .build();
     }
 
-    private ProjectTreeNode mapBatch(Batch batch, Project project) {
-        List<ImageUpload> uploads = imageUploadRepository.findByBatchIdOrderByCreatedAtDesc(batch.getId());
+    private ProjectTreeNode mapBatch(
+            Batch batch,
+            Project project,
+            Map<Long, List<Batch>> batchesByParentId,
+            Map<Long, List<ImageUpload>> uploadsByBatchId,
+            Map<Long, Long> commentCountByUploadId
+    ) {
+        List<ImageUpload> uploads = uploadsByBatchId.getOrDefault(batch.getId(), List.of());
 
         List<ProjectTreeNode> childNodes = new ArrayList<>();  // asset nodes built below
         for (ImageUpload upload : uploads) {
@@ -71,6 +112,8 @@ public class ProjectTreeService {
                     .map(t -> t.getValue())
                     .findFirst()
                     .orElse(null);
+
+            long commentsCount = commentCountByUploadId.getOrDefault(upload.getId(), 0L);
 
             childNodes.add(ProjectTreeNode.builder()
                     .id(String.valueOf(upload.getId()))
@@ -85,7 +128,7 @@ public class ProjectTreeService {
                             : null)
                     .uploadedBy(upload.getUploadedBy() != null ? upload.getUploadedBy().getName() : null)
                     .uploadDate(upload.getCreatedAt() != null ? upload.getCreatedAt().toString() : null)
-                    .commentsCount(upload.getComments() != null ? upload.getComments().size() : 0)
+                    .commentsCount((int) commentsCount)
                     .angle(angle)
                     .workflowStatus(upload.getWorkflowStatus())
                     .versionNumber(upload.getVersionNumber() != null ? upload.getVersionNumber() : 1)
@@ -95,17 +138,24 @@ public class ProjectTreeService {
         }
 
         // Prepend sub-batch nodes before asset nodes
-        List<ProjectTreeNode> subBatchNodes = batchRepository.findByParentBatchId(batch.getId()).stream()
-                .map(b -> mapBatch(b, project))
+        List<ProjectTreeNode> subBatchNodes = batchesByParentId.getOrDefault(batch.getId(), List.of()).stream()
+                .map(b -> mapBatch(b, project, batchesByParentId, uploadsByBatchId, commentCountByUploadId))
                 .collect(Collectors.toList());
         List<ProjectTreeNode> allChildren = new ArrayList<>(subBatchNodes);
         allChildren.addAll(childNodes);
         childNodes = allChildren;
 
-        int approved = imageUploadRepository.countApprovedByBatchId(batch.getId());
-        int rejected = imageUploadRepository.countRejectedByBatchId(batch.getId());
-        int pending = imageUploadRepository.countPendingByBatchId(batch.getId());
-        int total = (int) uploads.size();
+        // Mirrors the semantics of the old countApprovedByBatchId/countRejectedByBatchId/
+        // countPendingByBatchId queries: each condition is independent (an asset with an
+        // unrecognized status like "live" counts toward none of the three, same as before).
+        int approved = 0, rejected = 0, pending = 0;
+        for (ImageUpload u : uploads) {
+            String status = u.getApprovalStatus();
+            if (status != null && status.equalsIgnoreCase("approved")) approved++;
+            if (status != null && status.equalsIgnoreCase("rejected")) rejected++;
+            if (status == null || status.equalsIgnoreCase("pending")) pending++;
+        }
+        int total = uploads.size();
 
         // Roll up counts from sub-batches so a parent batch's totals reflect assets nested
         // inside its descendants too, not just files uploaded directly to it.

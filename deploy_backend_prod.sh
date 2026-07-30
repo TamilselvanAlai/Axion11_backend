@@ -86,7 +86,7 @@ gcloud run deploy axion11-backend \
     --region $REGION \
     --project $PROJECT_ID \
     --allow-unauthenticated \
-    --memory 4Gi \
+    --memory 8Gi \
     --cpu 2 \
     --timeout 600 \
     --execution-environment gen2 \

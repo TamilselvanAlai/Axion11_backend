@@ -26,6 +26,7 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.time.LocalDateTime;
 import java.util.*;
+import java.util.concurrent.ExecutorService;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -45,6 +46,7 @@ public class ImageUploadService {
     private final AuditService auditService;
     private final ImageQcService imageQcService;
     private final ProjectAccessService projectAccessService;
+    private final ExecutorService imageUploadExecutor;
 
     @Value("${gcs.bucket.name}")
     private String bucketName;
@@ -932,9 +934,24 @@ public class ImageUploadService {
         Long uid = uploader != null ? uploader.getId() : null;
         auditService.log("IMAGE_UPLOAD", pid, bid, imageUpload.getId(), uid, "Uploaded " + originalFileName);
 
-        // Async: download from GCS and run metadata extraction + AI tagging
+        // Download from GCS + metadata extraction + AI tagging happen off the request thread:
+        // for a large TIFF/PSD/RAW master this tail can easily take longer than the frontend's
+        // request timeout, which used to surface as a false "upload failed" even though the GCS
+        // PUT and the DB row above already succeeded. The response below returns as soon as the
+        // row exists, regardless of file size; the preview/thumbnail appears a little later.
         final Long uploadId = imageUpload.getId();
         final String ct = contentType != null ? contentType : "";
+        imageUploadExecutor.execute(() -> processConfirmedUpload(uploadId, gcsFileName, originalFileName, fileSize, ct));
+
+        return toDto(imageUpload);
+    }
+
+    /**
+     * Runs off the request thread (see confirmDirectUpload): downloads the confirmed upload's
+     * bytes from GCS, extracts metadata and generates its preview/thumbnail, and — for images
+     * small enough for the Vision API — runs AI tagging.
+     */
+    private void processConfirmedUpload(Long uploadId, String gcsFileName, String originalFileName, long fileSize, String ct) {
         final long maxDownloadSize = 40L * 1024 * 1024; // 40MB Vision API limit
 
         // Metadata/preview extraction runs regardless of contentType: browsers routinely send
@@ -983,8 +1000,6 @@ public class ImageUploadService {
         } catch (Exception e) {
             log.error("Processing failed for confirmed upload {}: {}", uploadId, e.getMessage(), e);
         }
-
-        return toDto(imageUpload);
     }
 
     private byte[] downloadFromGcs(String gcsFileName) {
@@ -1247,17 +1262,32 @@ public class ImageUploadService {
                             int longestSide = Math.max(fullWidth, fullHeight);
                             int previewMaxDim = 2000;
                             javax.imageio.ImageReadParam param = reader.getDefaultReadParam();
-                            if (longestSide > previewMaxDim) {
-                                int subsampling = Math.max(1, longestSide / previewMaxDim);
+                            int subsampling = longestSide > previewMaxDim ? Math.max(1, longestSide / previewMaxDim) : 1;
+                            if (subsampling > 1) {
                                 param.setSourceSubsampling(subsampling, subsampling, 0, 0);
                             }
                             try {
                                 img = reader.read(0, param);
                             } catch (Exception subsampleEx) {
-                                // Not every reader/format supports subsampled reads — fall back
-                                // to a full decode only when it's small enough to be safe;
-                                // otherwise skip the preview rather than risk exhausting heap.
-                                if ((long) fullWidth * fullHeight <= 4000L * 4000L) {
+                                // Not every reader supports the subsampling stride we asked for
+                                // first — before giving up, retry with progressively coarser
+                                // strides (smaller output, less memory), since a reader that
+                                // rejects one factor often accepts a larger one. Only fall back
+                                // to a full decode (small images only) or skip the preview
+                                // entirely if every stride fails, to avoid exhausting heap.
+                                java.awt.image.BufferedImage retried = null;
+                                for (int coarser = subsampling * 2; coarser <= 32 && retried == null; coarser *= 2) {
+                                    try {
+                                        javax.imageio.ImageReadParam retryParam = reader.getDefaultReadParam();
+                                        retryParam.setSourceSubsampling(coarser, coarser, 0, 0);
+                                        retried = reader.read(0, retryParam);
+                                    } catch (Exception ignoredRetry) {
+                                        // try the next, coarser stride
+                                    }
+                                }
+                                if (retried != null) {
+                                    img = retried;
+                                } else if ((long) fullWidth * fullHeight <= 4000L * 4000L) {
                                     img = reader.read(0);
                                 } else {
                                     log.warn("Skipping preview for {} — {}x{} is too large to safely decode and its reader doesn't support subsampled reads",
@@ -1293,12 +1323,17 @@ public class ImageUploadService {
                                 }
                             }
                         }
-                    } catch (Exception ignore) {}
+                    } catch (Exception e) {
+                        log.warn("Preview/color-space step failed for {} (reader {}): {}",
+                                imageUpload.getFileName(), reader.getClass().getSimpleName(), String.valueOf(e), e);
+                    }
                     reader.dispose();
                 }
                 iis.close();
             }
-        } catch (Exception ignore) {}
+        } catch (Exception e) {
+            log.warn("ImageIO reader setup failed for {}: {}", imageUpload.getFileName(), String.valueOf(e), e);
+        }
 
         // Fallback: for RAW files (CR3, CR2, NEF, ARW) that ImageIO can't read,
         // extract the embedded JPEG preview using metadata-extractor
@@ -2155,8 +2190,13 @@ public class ImageUploadService {
      */
     private byte[] downloadImage(java.net.http.HttpClient httpClient, String imageUrl) {
         try {
+            // GCS object names (and so these public URLs) can contain raw spaces from the
+            // original filename (e.g. "IMG_7249 2.HEIC") — URI.create() rejects those outright,
+            // so percent-encode the one character we know appears in practice rather than
+            // failing every download for such a file.
             java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
-                    .uri(java.net.URI.create(imageUrl))
+                    .uri(java.net.URI.create(imageUrl.replace(" ", "%20")))
+                    .timeout(java.time.Duration.ofSeconds(60))
                     .GET()
                     .build();
             java.net.http.HttpResponse<byte[]> response = httpClient.send(request,
