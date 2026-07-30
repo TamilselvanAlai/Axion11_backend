@@ -937,28 +937,35 @@ public class ImageUploadService {
         final String ct = contentType != null ? contentType : "";
         final long maxDownloadSize = 40L * 1024 * 1024; // 40MB Vision API limit
 
-        if (ct.startsWith("image/")) {
-            // Process synchronously (Cloud Run kills async threads after response)
-            try {
-                ImageUpload u = imageUploadRepository.findById(uploadId).orElse(null);
-                if (u != null) {
-                    if (fileSize <= maxDownloadSize) {
-                        byte[] bytes = downloadFromGcs(gcsFileName);
-                        if (bytes != null) {
-                            extractAndSaveMetadata(u, bytes);
+        // Metadata/preview extraction runs regardless of contentType: browsers routinely send
+        // an empty or generic "application/octet-stream" type for formats they don't have a
+        // registered MIME for (CR3, HEIC, and other RAW/camera formats all hit this in
+        // practice), and gating on ct.startsWith("image/") here used to silently skip preview
+        // generation entirely for exactly those files. Vision API tagging genuinely needs real
+        // decodable image bytes, so that alone stays gated below.
+        try {
+            ImageUpload u = imageUploadRepository.findById(uploadId).orElse(null);
+            if (u != null) {
+                if (fileSize <= maxDownloadSize) {
+                    byte[] bytes = downloadFromGcs(gcsFileName);
+                    if (bytes != null) {
+                        extractAndSaveMetadata(u, bytes);
+                        if (ct.startsWith("image/")) {
                             analyzeImageDeferred(uploadId, bytes);
                         }
-                    } else {
-                        log.info("File {} is {}MB, too large for Vision API. Generating preview.", originalFileName, fileSize / (1024 * 1024));
-                        try {
-                            byte[] fullBytes = downloadFromGcs(gcsFileName);
-                            if (fullBytes != null) {
-                                extractAndSaveMetadata(u, fullBytes);
-                                fullBytes = null;
-                            }
-                        } catch (Exception metaEx) {
-                            log.error("Metadata extraction failed for large file {}: {}", originalFileName, metaEx.getMessage());
+                    }
+                } else {
+                    log.info("File {} is {}MB, too large for Vision API. Generating preview.", originalFileName, fileSize / (1024 * 1024));
+                    try {
+                        byte[] fullBytes = downloadFromGcs(gcsFileName);
+                        if (fullBytes != null) {
+                            extractAndSaveMetadata(u, fullBytes);
+                            fullBytes = null;
                         }
+                    } catch (Exception metaEx) {
+                        log.error("Metadata extraction failed for large file {}: {}", originalFileName, metaEx.getMessage());
+                    }
+                    if (ct.startsWith("image/")) {
                         u = imageUploadRepository.findById(uploadId).orElse(null);
                         if (u != null && u.getPreviewUrl() != null) {
                             String previewGcsName = u.getPreviewUrl().replace("https://storage.googleapis.com/" + bucketName + "/", "");
@@ -972,9 +979,9 @@ public class ImageUploadService {
                         }
                     }
                 }
-            } catch (Exception e) {
-                log.error("Processing failed for confirmed upload {}: {}", uploadId, e.getMessage(), e);
             }
+        } catch (Exception e) {
+            log.error("Processing failed for confirmed upload {}: {}", uploadId, e.getMessage(), e);
         }
 
         return toDto(imageUpload);
@@ -1226,7 +1233,38 @@ public class ImageUploadService {
                     try {
                         java.awt.image.BufferedImage img;
                         try {
-                            img = reader.read(0);
+                            // The preview this feeds into is capped at 2000px on its longest
+                            // side (see generateAndUploadPreview) — decoding a source many
+                            // times larger than that at full resolution just to immediately
+                            // downscale it wastes huge amounts of heap (a several-hundred-MB
+                            // to multi-GB TIFF/PSD master can need many times its file size as
+                            // a decoded BufferedImage) and risks an OutOfMemoryError that would
+                            // abort the whole request before any preview is saved. Subsample
+                            // down towards preview resolution instead whenever the reader
+                            // supports it.
+                            int fullWidth = reader.getWidth(0);
+                            int fullHeight = reader.getHeight(0);
+                            int longestSide = Math.max(fullWidth, fullHeight);
+                            int previewMaxDim = 2000;
+                            javax.imageio.ImageReadParam param = reader.getDefaultReadParam();
+                            if (longestSide > previewMaxDim) {
+                                int subsampling = Math.max(1, longestSide / previewMaxDim);
+                                param.setSourceSubsampling(subsampling, subsampling, 0, 0);
+                            }
+                            try {
+                                img = reader.read(0, param);
+                            } catch (Exception subsampleEx) {
+                                // Not every reader/format supports subsampled reads — fall back
+                                // to a full decode only when it's small enough to be safe;
+                                // otherwise skip the preview rather than risk exhausting heap.
+                                if ((long) fullWidth * fullHeight <= 4000L * 4000L) {
+                                    img = reader.read(0);
+                                } else {
+                                    log.warn("Skipping preview for {} — {}x{} is too large to safely decode and its reader doesn't support subsampled reads",
+                                            imageUpload.getFileName(), fullWidth, fullHeight);
+                                    img = null;
+                                }
+                            }
                         } catch (Exception readEx) {
                             log.warn("ImageIO could not decode {} (reader {}): {}",
                                     imageUpload.getFileName(), reader.getClass().getSimpleName(), readEx.getMessage());
