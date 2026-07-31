@@ -1,8 +1,10 @@
 package com.axion11.visualops.repository;
 
 import com.axion11.visualops.models.ImageUpload;
+import jakarta.persistence.LockModeType;
 import org.springframework.data.jpa.repository.EntityGraph;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
@@ -35,6 +37,17 @@ public interface ImageUploadRepository extends JpaRepository<ImageUpload, Long> 
 
     /** All versions that share the same original upload (v2, v3, …), oldest first. */
     List<ImageUpload> findByOriginalUploadIdOrderByVersionNumberAsc(Long originalUploadId);
+
+    /** Locks a chain's root row (v1) for the rest of the current transaction — used by the
+     *  edit-and-resync flow (see ImageUploadService#syncEditedVersion) so two concurrent saves
+     *  for the same asset serialize through the database. A plain in-process `synchronized`
+     *  block only protects against races within a single JVM; Cloud Run can run multiple
+     *  container instances, so two near-simultaneous saves landing on different instances would
+     *  both see "no established version yet" and each create their own. A DB-level lock blocks
+     *  the second transaction until the first commits, regardless of which instance either runs on. */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT u FROM ImageUpload u WHERE u.id = :id")
+    Optional<ImageUpload> findByIdForUpdate(@Param("id") Long id);
 
     /** Uploads with no generated preview yet — candidates for the PSD/RAW/video preview backfill. */
     List<ImageUpload> findByPreviewUrlIsNull();

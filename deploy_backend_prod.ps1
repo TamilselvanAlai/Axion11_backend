@@ -12,21 +12,12 @@ $GOOGLE_DRIVE_CLIENT_ID = "469711794178-ece32jugi3av3k6125glig1oat8hvops.apps.go
 $GOOGLE_SIGNIN_REDIRECT_URI = "https://imagemx.online/oauth/callback/google-signin"
 $SEED_DEMO_DATA = "false"
 
-# Secrets are read from the environment — set them (or `. .\env.deploy.ps1`, a local,
-# gitignored script) before running this. See .env.deploy.example.
-#
-# GEMINI_API_KEY is deliberately NOT in this list: it's left out of the deploy payload
-# entirely below (and out of $ownedKeys, so it instead flows through the generic .env
-# forwarding loop, which already skips blank values) so a blank/missing local value can
-# never overwrite whatever key is already live on the Cloud Run service.
-foreach ($name in "DB_PASSWORD", "JWT_SECRET", "GOOGLE_DRIVE_CLIENT_SECRET") {
-    if (-not (Get-Item "env:$name" -ErrorAction SilentlyContinue)) {
-        throw "Set `$env:$name before running this script"
-    }
-}
-$DB_PASSWORD = $env:DB_PASSWORD
-$JWT_SECRET = $env:JWT_SECRET
-$GOOGLE_DRIVE_CLIENT_SECRET = $env:GOOGLE_DRIVE_CLIENT_SECRET
+# DB_PASSWORD, JWT_SECRET, GOOGLE_DRIVE_CLIENT_SECRET, and GEMINI_API_KEY are all deliberately
+# NOT in the hardcoded list below: they're left out of the deploy payload entirely (and out of
+# $ownedKeys, so they instead flow through the generic .env forwarding loop, which already skips
+# blank values) so a blank/missing local value can never overwrite whatever key is already live
+# on the Cloud Run service. Set them in the environment (or in .env) to override the live value;
+# leave them unset to deploy the new code with the live secrets untouched.
 
 $INSTANCE_CONNECTION_NAME = "${PROJECT_ID}:${REGION}:${DB_INSTANCE_NAME}"
 $BACKEND_IMG = "${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REPO}/backend:latest"
@@ -72,8 +63,11 @@ Write-Host "--> Deploying Backend to Cloud Run..."
 $unixTime = [int][datetime]::UtcNow.Subtract((New-Object datetime 1970, 1, 1)).TotalSeconds
 
 # Vars this script computes/owns directly (order matches the historical hardcoded list).
-$envVars = "SERVER_PORT=8080|DB_URL=jdbc:mysql:///${DB_NAME}?cloudSqlInstance=${INSTANCE_CONNECTION_NAME}&socketFactory=com.google.cloud.sql.mysql.SocketFactory&useSSL=false|DB_USER=${DB_USER}|DB_PASSWORD=${DB_PASSWORD}|JWT_SECRET=${JWT_SECRET}|JWT_EXPIRATION=86400000|CORS_ORIGINS=${CORS_ORIGINS}|FRONTEND_URL=${FRONTEND_URL}|GCS_BUCKET_NAME=${GCS_BUCKET_NAME}|GOOGLE_DRIVE_CLIENT_ID=${GOOGLE_DRIVE_CLIENT_ID}|GOOGLE_DRIVE_CLIENT_SECRET=${GOOGLE_DRIVE_CLIENT_SECRET}|GOOGLE_SIGNIN_REDIRECT_URI=${GOOGLE_SIGNIN_REDIRECT_URI}|SEED_DEMO_DATA=${SEED_DEMO_DATA}"
-$ownedKeys = @("SERVER_PORT","DB_URL","DB_USER","DB_PASSWORD","JWT_SECRET","JWT_EXPIRATION","CORS_ORIGINS","FRONTEND_URL","GCS_BUCKET_NAME","GOOGLE_DRIVE_CLIENT_ID","GOOGLE_DRIVE_CLIENT_SECRET","GOOGLE_SIGNIN_REDIRECT_URI","SEED_DEMO_DATA")
+# DB_PASSWORD, JWT_SECRET, GOOGLE_DRIVE_CLIENT_SECRET, GEMINI_API_KEY are intentionally absent —
+# see the comment above where they used to be read from the environment. They're picked up below
+# by the generic .env forwarding loop instead, if and only if present there.
+$envVars = "SERVER_PORT=8080|DB_URL=jdbc:mysql:///${DB_NAME}?cloudSqlInstance=${INSTANCE_CONNECTION_NAME}&socketFactory=com.google.cloud.sql.mysql.SocketFactory&useSSL=false|DB_USER=${DB_USER}|JWT_EXPIRATION=86400000|CORS_ORIGINS=${CORS_ORIGINS}|FRONTEND_URL=${FRONTEND_URL}|GCS_BUCKET_NAME=${GCS_BUCKET_NAME}|GOOGLE_DRIVE_CLIENT_ID=${GOOGLE_DRIVE_CLIENT_ID}|GOOGLE_SIGNIN_REDIRECT_URI=${GOOGLE_SIGNIN_REDIRECT_URI}|SEED_DEMO_DATA=${SEED_DEMO_DATA}"
+$ownedKeys = @("SERVER_PORT","DB_URL","DB_USER","JWT_EXPIRATION","CORS_ORIGINS","FRONTEND_URL","GCS_BUCKET_NAME","GOOGLE_DRIVE_CLIENT_ID","GOOGLE_SIGNIN_REDIRECT_URI","SEED_DEMO_DATA")
 
 # Forward every other var defined in .env verbatim (Google desktop client id, mail, OneDrive,
 # etc.) so new config only ever needs to be added in one place instead of being hand-copied

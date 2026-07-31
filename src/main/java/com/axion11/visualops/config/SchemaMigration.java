@@ -23,6 +23,29 @@ public class SchemaMigration implements ApplicationRunner {
         alterColumnNullable("comments", "asset_id");
         rewriteOldBucketUrls();
         renamePendingApprovalStatusToDraft();
+        backfillMissingProjectIdFromBatch();
+    }
+
+    /** Uploads made directly into a batch (the signed-URL confirm path, {@code /uploads/confirm})
+     *  only ever received a batchId from the frontend, never a projectId — so their project_id
+     *  column was left NULL even though batch_id was set correctly. That's invisible in views
+     *  that query by batch_id directly (e.g. the desktop app's asset list), but the web app's
+     *  project-tree endpoint queries uploads by their own project_id and silently excludes any
+     *  row with a NULL one — showing "Total Assets: 0" for a batch the desktop app shows assets
+     *  in. Backfills existing rows; ImageUploadService#confirmDirectUpload now also sets this
+     *  going forward so new uploads never end up in this state. Idempotent. */
+    private void backfillMissingProjectIdFromBatch() {
+        try {
+            int updated = jdbc.update(
+                    "UPDATE image_uploads iu " +
+                    "JOIN batches b ON b.id = iu.batch_id " +
+                    "SET iu.project_id = b.project_id " +
+                    "WHERE iu.project_id IS NULL AND iu.batch_id IS NOT NULL AND b.project_id IS NOT NULL"
+            );
+            if (updated > 0) log.info("Schema migration: backfilled image_uploads.project_id from batch on {} rows", updated);
+        } catch (Exception e) {
+            log.debug("Schema migration skipped for image_uploads.project_id backfill: {}", e.getMessage());
+        }
     }
 
     /** approvalStatus's default changed from "pending" to "draft" (draft -> approved -> live

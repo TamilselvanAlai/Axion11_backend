@@ -17,6 +17,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -799,10 +800,29 @@ public class ImageUploadService {
      * @param anyIdInChain any version's id in the same chain as the edited asset (typically
      *                     whichever version was open locally when the edit was saved)
      */
-    @Transactional
+    // READ_COMMITTED, not the default REPEATABLE READ: under REPEATABLE READ, this transaction's
+    // plain (non-locking) reads keep using the snapshot from its very first query, even after
+    // waiting on findByIdForUpdate's row lock below and even though the row that was being
+    // waited on has since committed new sibling rows. That let two concurrent edits of the same
+    // asset both "wait their turn" correctly but still both see "no established version yet"
+    // afterward, each forking its own row. READ_COMMITTED re-reads latest-committed data on every
+    // statement, so the second transaction sees the first one's committed row once it's unblocked.
+    @Transactional(isolation = Isolation.READ_COMMITTED)
     public ImageUploadDto syncEditedVersion(Long anyIdInChain, String gcsFileName, String contentType, long fileSize, String uploaderEmail) {
         ImageUpload anchor = imageUploadRepository.findById(anyIdInChain)
                 .orElseThrow(() -> new NoSuchElementException("Upload not found: " + anyIdInChain));
+
+        // DB-level lock on the chain's root row, held for the rest of this transaction — see
+        // ImageUploadRepository#findByIdForUpdate. The `synchronized` block below is kept too
+        // (harmless, and still helps within a single instance) but can't be relied on alone: two
+        // near-simultaneous saves for the same asset can land on different Cloud Run instances,
+        // where an in-process lock provides no protection and both could see "no established
+        // version yet" and each create their own.
+        Long chainRootId = anchor.getOriginalUploadId() != null ? anchor.getOriginalUploadId() : anchor.getId();
+        long lockWaitStart = System.currentTimeMillis();
+        imageUploadRepository.findByIdForUpdate(chainRootId);
+        log.info("syncEditedVersion[{}]: lock on chainRoot={} acquired after {}ms (thread={})",
+                anyIdInChain, chainRootId, System.currentTimeMillis() - lockWaitStart, Thread.currentThread().getName());
 
         String gcsPath = "gs://" + bucketName + "/" + gcsFileName;
         String publicUrl = "https://storage.googleapis.com/" + bucketName + "/" + gcsFileName;
@@ -810,15 +830,24 @@ public class ImageUploadService {
         synchronized (versionLockFor(anchor.getFileName(), anchor.getBatch() != null ? anchor.getBatch().getId() : null)) {
             List<ImageUpload> chain = resolveVersionChain(anchor.getId());
             ImageUpload established = chain.stream().filter(ImageUpload::isEstablished).findFirst().orElse(null);
+            log.info("syncEditedVersion[{}]: chainRoot={} resolved {} row(s) [{}], established={}",
+                    anyIdInChain, chainRootId, chain.size(),
+                    chain.stream().map(u -> u.getId() + "/v" + u.getVersionNumber() + (u.isEstablished() ? "*" : "")).toList(),
+                    established != null ? established.getId() : "none");
 
             ImageUpload target;
             if (established != null) {
                 // Second+ edit — update the existing VE row in place. v1 (and every other
                 // version in the chain) is never touched.
                 target = established;
+            } else if (chain.size() > 1) {
+                // The chain's one extra slot already exists but was finalized into "v2" by a
+                // same-name re-upload (see findExistingSecondSlot/resolveVersion) — reopen it for
+                // editing instead of forking a third row. markEstablished below re-flags it VE.
+                target = chain.get(chain.size() - 1);
             } else {
-                // First edit — v1 stays untouched; the edit becomes a brand-new VE row instead
-                // of overwriting it.
+                // First-ever edit — v1 stays untouched; the edit becomes the chain's one extra
+                // slot instead of overwriting it.
                 ImageUpload v1 = chain.isEmpty() ? anchor : chain.get(0);
                 Long rootId = v1.getOriginalUploadId() != null ? v1.getOriginalUploadId() : v1.getId();
                 int nextVersion = chain.stream()
@@ -860,6 +889,8 @@ public class ImageUploadService {
             // unreviewed edit as already approved.
             target.setImageQualityQcCheck(null);
             target = imageUploadRepository.save(target);
+            log.info("syncEditedVersion[{}]: target row id={} v{} (thread={})",
+                    anyIdInChain, target.getId(), target.getVersionNumber(), Thread.currentThread().getName());
 
             markEstablished(target.getId());
 
@@ -897,26 +928,54 @@ public class ImageUploadService {
 
         ImageUpload imageUpload;
         synchronized (versionLockFor(originalFileName, batchId)) {
-            long[] ver = resolveVersion(originalFileName, batchId);
+            ImageUpload existingSlot = findExistingSecondSlot(originalFileName, batchId);
 
-            imageUpload = ImageUpload.builder()
-                    .fileName(originalFileName)
-                    .gcsPath(gcsPath)
-                    .publicUrl(publicUrl)
-                    .contentType(contentType)
-                    .fileSize(fileSize)
-                    .project(project)
-                    .uploadedBy(uploader)
-                    .createdAt(LocalDateTime.now())
-                    .versionNumber((int) ver[0])
-                    .originalUploadId(ver[1] < 0 ? null : ver[1])
-                    .build();
+            if (existingSlot != null) {
+                // Same-name re-upload after edits — overwrite the chain's one extra slot in
+                // place instead of forking v3/v4/v5. This also finalizes it: it's no longer the
+                // "VE" working copy once a fresh file is stacked on top of it.
+                existingSlot.setGcsPath(gcsPath);
+                existingSlot.setPublicUrl(publicUrl);
+                existingSlot.setContentType(contentType);
+                existingSlot.setFileSize(fileSize);
+                existingSlot.setFileName(originalFileName);
+                existingSlot.setUploadedBy(uploader);
+                existingSlot.setCreatedAt(LocalDateTime.now());
+                existingSlot.setApprovalStatus("draft");
+                existingSlot.setImageQualityQcCheck(null);
+                existingSlot.setPreviewUrl(null);
+                existingSlot.setEstablished(false);
+                imageUpload = existingSlot;
+            } else {
+                long[] ver = resolveVersion(originalFileName, batchId);
+                imageUpload = ImageUpload.builder()
+                        .fileName(originalFileName)
+                        .gcsPath(gcsPath)
+                        .publicUrl(publicUrl)
+                        .contentType(contentType)
+                        .fileSize(fileSize)
+                        .project(project)
+                        .uploadedBy(uploader)
+                        .createdAt(LocalDateTime.now())
+                        .versionNumber((int) ver[0])
+                        .originalUploadId(ver[1] < 0 ? null : ver[1])
+                        .build();
+            }
 
             if (batchId != null) {
                 Batch batch = batchRepository.findById(batchId).orElse(null);
                 if (batch != null) {
                     imageUpload.setBatch(batch);
                     imageUpload.setUploadStatus("COMPLETED");
+                    // The frontend only sends a batchId when uploading directly into a batch (no
+                    // projectId) — without this, the row's own project_id stayed NULL forever.
+                    // That's invisible to anything that queries by batch_id (e.g. the desktop
+                    // app's asset list), but the web app's project-tree endpoint queries uploads
+                    // by their own project_id and silently excludes rows with a NULL one, showing
+                    // "Total Assets: 0" for a batch that visibly has assets elsewhere.
+                    if (imageUpload.getProject() == null) {
+                        imageUpload.setProject(batch.getProject());
+                    }
                 }
             }
 
@@ -979,8 +1038,13 @@ public class ImageUploadService {
                             extractAndSaveMetadata(u, fullBytes);
                             fullBytes = null;
                         }
-                    } catch (Exception metaEx) {
-                        log.error("Metadata extraction failed for large file {}: {}", originalFileName, metaEx.getMessage());
+                    } catch (Throwable metaEx) {
+                        // Throwable, not Exception: decoding a large TIFF/PSD/RAW master can throw
+                        // OutOfMemoryError deep inside ImageIO, which a plain `catch (Exception)`
+                        // lets straight through — silently killing this background task before any
+                        // preview is saved. Catching it here just logs it and leaves the row as-is
+                        // (still previewless), instead of leaving no trace at all.
+                        log.error("Metadata extraction failed for large file {}: {}", originalFileName, metaEx.getMessage(), metaEx);
                     }
                     if (ct.startsWith("image/")) {
                         u = imageUploadRepository.findById(uploadId).orElse(null);
@@ -997,7 +1061,11 @@ public class ImageUploadService {
                     }
                 }
             }
-        } catch (Exception e) {
+        } catch (Throwable e) {
+            // Throwable, not Exception, for the same reason as the inner catch above: this whole
+            // method runs on a background executor thread, and an uncaught Error (e.g. an
+            // OutOfMemoryError from decoding a huge master file) kills that thread silently
+            // instead of just failing this one upload's metadata/preview extraction.
             log.error("Processing failed for confirmed upload {}: {}", uploadId, e.getMessage(), e);
         }
     }
@@ -1046,21 +1114,57 @@ public class ImageUploadService {
         String publicUrl = "https://storage.googleapis.com/" + bucketName + "/" + fileName;
         ImageUpload imageUpload;
         synchronized (versionLockFor(originalFilename, batchId)) {
-            long[] ver = resolveVersion(originalFilename, batchId);
-            imageUpload = ImageUpload.builder()
-                    .fileName(originalFilename)
-                    .gcsPath("gs://" + bucketName + "/" + fileName)
-                    .publicUrl(publicUrl)
-                    .contentType(contentType)
-                    .fileSize(size)
-                    .project(project)
-                    .uploadedBy(uploader)
-                    .createdAt(LocalDateTime.now())
-                    .versionNumber((int) ver[0])
-                    .originalUploadId(ver[1] < 0 ? null : ver[1])
-                    .build();
+            ImageUpload existingSlot = findExistingSecondSlot(originalFilename, batchId);
+
+            if (existingSlot != null) {
+                // Same-name re-upload after edits — overwrite the chain's one extra slot in
+                // place instead of forking v3/v4/v5. This also finalizes it: it's no longer the
+                // "VE" working copy once a fresh file is stacked on top of it.
+                existingSlot.setGcsPath("gs://" + bucketName + "/" + fileName);
+                existingSlot.setPublicUrl(publicUrl);
+                existingSlot.setContentType(contentType);
+                existingSlot.setFileSize(size);
+                existingSlot.setFileName(originalFilename);
+                existingSlot.setUploadedBy(uploader);
+                existingSlot.setCreatedAt(LocalDateTime.now());
+                existingSlot.setApprovalStatus("draft");
+                existingSlot.setImageQualityQcCheck(null);
+                existingSlot.setPreviewUrl(null);
+                existingSlot.setEstablished(false);
+                imageUpload = existingSlot;
+            } else {
+                long[] ver = resolveVersion(originalFilename, batchId);
+                imageUpload = ImageUpload.builder()
+                        .fileName(originalFilename)
+                        .gcsPath("gs://" + bucketName + "/" + fileName)
+                        .publicUrl(publicUrl)
+                        .contentType(contentType)
+                        .fileSize(size)
+                        .project(project)
+                        .uploadedBy(uploader)
+                        .createdAt(LocalDateTime.now())
+                        .versionNumber((int) ver[0])
+                        .originalUploadId(ver[1] < 0 ? null : ver[1])
+                        .build();
+            }
             imageUpload = imageUploadRepository.save(imageUpload);
         }
+
+        // This streaming path intentionally never holds the whole file in memory for the GCS
+        // upload above, which meant metadata/thumbnail extraction was silently skipped for every
+        // file large enough to land here (TIFF/PSD masters routinely are) — unlike the small-file
+        // path (uploadToGcsAndSave) and the edit-resync path (syncEditedVersion), both of which
+        // already do this. Downloading the bytes back from GCS here, same as those two, is what
+        // finally generates the thumbnail/preview on initial upload instead of only after an edit.
+        try {
+            byte[] freshBytes = downloadFromGcs(fileName);
+            if (freshBytes != null) {
+                extractAndSaveMetadata(imageUpload, freshBytes);
+            }
+        } catch (Exception e) {
+            log.warn("Metadata/preview extraction failed for {}: {}", originalFilename, e.getMessage());
+        }
+
         return toDto(imageUpload);
     }
 
@@ -1124,20 +1228,39 @@ public class ImageUploadService {
 
         ImageUpload imageUpload;
         synchronized (versionLockFor(originalFilename, batchId)) {
-            long[] ver = resolveVersion(originalFilename, batchId);
+            ImageUpload existingSlot = findExistingSecondSlot(originalFilename, batchId);
 
-            imageUpload = ImageUpload.builder()
-                    .fileName(originalFilename)
-                    .gcsPath(gcsPath)
-                    .publicUrl(publicUrl)
-                    .contentType(contentType)
-                    .fileSize(size)
-                    .project(project)
-                    .uploadedBy(uploader)
-                    .createdAt(LocalDateTime.now())
-                    .versionNumber((int) ver[0])
-                    .originalUploadId(ver[1] < 0 ? null : ver[1])
-                    .build();
+            if (existingSlot != null) {
+                // Same-name re-upload after edits — overwrite the chain's one extra slot in
+                // place instead of forking v3/v4/v5. This also finalizes it: it's no longer the
+                // "VE" working copy once a fresh file is stacked on top of it.
+                existingSlot.setGcsPath(gcsPath);
+                existingSlot.setPublicUrl(publicUrl);
+                existingSlot.setContentType(contentType);
+                existingSlot.setFileSize(size);
+                existingSlot.setFileName(originalFilename);
+                existingSlot.setUploadedBy(uploader);
+                existingSlot.setCreatedAt(LocalDateTime.now());
+                existingSlot.setApprovalStatus("draft");
+                existingSlot.setImageQualityQcCheck(null);
+                existingSlot.setPreviewUrl(null);
+                existingSlot.setEstablished(false);
+                imageUpload = existingSlot;
+            } else {
+                long[] ver = resolveVersion(originalFilename, batchId);
+                imageUpload = ImageUpload.builder()
+                        .fileName(originalFilename)
+                        .gcsPath(gcsPath)
+                        .publicUrl(publicUrl)
+                        .contentType(contentType)
+                        .fileSize(size)
+                        .project(project)
+                        .uploadedBy(uploader)
+                        .createdAt(LocalDateTime.now())
+                        .versionNumber((int) ver[0])
+                        .originalUploadId(ver[1] < 0 ? null : ver[1])
+                        .build();
+            }
             imageUpload = imageUploadRepository.save(imageUpload);
         }
 
@@ -1218,7 +1341,7 @@ public class ImageUploadService {
                     imageUpload.setPreviewUrl(previewUrl);
                     log.info("Generated video frame preview for {}: {}", imageUpload.getFileName(), previewUrl);
                 }
-            } catch (Exception e) {
+            } catch (Throwable e) {
                 log.warn("Failed to extract video frame preview for {}: {}", imageUpload.getFileName(), e.getMessage());
             }
             imageUploadRepository.save(imageUpload);
@@ -1244,7 +1367,17 @@ public class ImageUploadService {
                             org.w3c.dom.Node root = metadata.getAsTree(metadata.getNativeMetadataFormatName());
                             extractDpiFromMetadata(imageUpload, root);
                         }
-                    } catch (Exception ignore) {}
+                    } catch (Throwable ignore) {
+                        // DPI is a nice-to-have, not essential — but TwelveMonkeys' TIFF metadata
+                        // tree-building (asTree) can throw OutOfMemoryError on some TIFFs with
+                        // large metadata blocks, which `catch (Exception)` alone does NOT catch
+                        // (Error is a sibling of Exception, not a subtype). Left uncaught, that
+                        // OOM used to kill this whole background thread and abort the width/
+                        // height/preview extraction below it too — silently leaving the asset
+                        // with no thumbnail at all. Catching Throwable here keeps a DPI failure
+                        // exactly as ignorable as it always was, without taking the rest of
+                        // metadata/preview extraction down with it.
+                    }
                     try {
                         java.awt.image.BufferedImage img;
                         try {
@@ -1268,20 +1401,24 @@ public class ImageUploadService {
                             }
                             try {
                                 img = reader.read(0, param);
-                            } catch (Exception subsampleEx) {
-                                // Not every reader supports the subsampling stride we asked for
-                                // first — before giving up, retry with progressively coarser
-                                // strides (smaller output, less memory), since a reader that
-                                // rejects one factor often accepts a larger one. Only fall back
-                                // to a full decode (small images only) or skip the preview
-                                // entirely if every stride fails, to avoid exhausting heap.
+                            } catch (Throwable subsampleEx) {
+                                // Throwable, not Exception: a reader that rejects a subsampling
+                                // stride can also throw OutOfMemoryError (not just a decode
+                                // Exception) if it buffers more than expected before honoring the
+                                // stride — catching only Exception let that OOM skip the whole
+                                // retry ladder below and kill the caller's background thread.
+                                // Before giving up, retry with progressively coarser strides
+                                // (smaller output, less memory), since a reader that rejects one
+                                // factor often accepts a larger one. Only fall back to a full
+                                // decode (small images only) or skip the preview entirely if
+                                // every stride fails, to avoid exhausting heap.
                                 java.awt.image.BufferedImage retried = null;
                                 for (int coarser = subsampling * 2; coarser <= 32 && retried == null; coarser *= 2) {
                                     try {
                                         javax.imageio.ImageReadParam retryParam = reader.getDefaultReadParam();
                                         retryParam.setSourceSubsampling(coarser, coarser, 0, 0);
                                         retried = reader.read(0, retryParam);
-                                    } catch (Exception ignoredRetry) {
+                                    } catch (Throwable ignoredRetry) {
                                         // try the next, coarser stride
                                     }
                                 }
@@ -1295,7 +1432,10 @@ public class ImageUploadService {
                                     img = null;
                                 }
                             }
-                        } catch (Exception readEx) {
+                        } catch (Throwable readEx) {
+                            // Throwable: decoding a large/uncompressed-in-memory TIFF or PSD is
+                            // exactly the kind of operation that can throw OutOfMemoryError rather
+                            // than a plain decode Exception.
                             log.warn("ImageIO could not decode {} (reader {}): {}",
                                     imageUpload.getFileName(), reader.getClass().getSimpleName(), readEx.getMessage());
                             img = null;
@@ -1318,12 +1458,12 @@ public class ImageUploadService {
                                         imageUpload.setPreviewUrl(previewUrl);
                                         log.info("Generated preview for {}: {}", imageUpload.getFileName(), previewUrl);
                                     }
-                                } catch (Exception previewEx) {
+                                } catch (Throwable previewEx) {
                                     log.warn("Failed to generate preview for {}: {}", imageUpload.getFileName(), previewEx.getMessage());
                                 }
                             }
                         }
-                    } catch (Exception e) {
+                    } catch (Throwable e) {
                         log.warn("Preview/color-space step failed for {} (reader {}): {}",
                                 imageUpload.getFileName(), reader.getClass().getSimpleName(), String.valueOf(e), e);
                     }
@@ -1331,7 +1471,13 @@ public class ImageUploadService {
                 }
                 iis.close();
             }
-        } catch (Exception e) {
+        } catch (Throwable e) {
+            // Throwable throughout this method, not just Exception: an OutOfMemoryError while
+            // decoding a large TIFF/PSD source is a real, observed failure mode here (see the
+            // narrower catches above) — anything weaker than Throwable at any of these levels
+            // lets that Error skip straight past this whole method and kill whatever background
+            // thread called it (processConfirmedUpload/syncEditedVersion/etc.), silently leaving
+            // the asset with no width/height/preview at all instead of just logging and moving on.
             log.warn("ImageIO reader setup failed for {}: {}", imageUpload.getFileName(), String.valueOf(e), e);
         }
 
@@ -1344,7 +1490,7 @@ public class ImageUploadService {
                     imageUpload.setPreviewUrl(previewUrl);
                     log.info("Extracted embedded preview for {}: {}", imageUpload.getFileName(), previewUrl);
                 }
-            } catch (Exception e) {
+            } catch (Throwable e) {
                 log.warn("Failed to extract embedded preview for {}: {}", imageUpload.getFileName(), e.getMessage());
             }
         }
@@ -2374,6 +2520,31 @@ public class ImageUploadService {
         extractAndSaveMetadata(imageUpload, imageBytes);
 
         return toDto(imageUpload);
+    }
+
+    /**
+     * The chain's existing "second slot" row for a same-named file in this batch — the one extra
+     * row beyond v1, which is "VE" while {@code established} and becomes the final "v2" once a
+     * same-name re-upload lands on it — or null if only v1 exists so far (or no match at all).
+     * Chains are capped at this one extra row: a plain re-upload of a matching filename overwrites
+     * it in place instead of forking a new v3/v4/v5, mirroring how {@link #syncEditedVersion}
+     * already overwrites it in place across repeated edits.
+     */
+    private ImageUpload findExistingSecondSlot(String fileName, Long batchId) {
+        if (batchId == null) return null;
+        List<ImageUpload> existing = imageUploadRepository
+                .findByFileNameAndBatchIdOrderByVersionNumberDesc(fileName, batchId);
+        if (existing.isEmpty()) {
+            String baseName = stripExtension(fileName);
+            existing = imageUploadRepository.findByBatchIdOrderByCreatedAtDesc(batchId).stream()
+                    .filter(u -> stripExtension(u.getFileName()).equalsIgnoreCase(baseName))
+                    .toList();
+        }
+        if (existing.isEmpty()) return null;
+        ImageUpload any = existing.get(0);
+        Long rootId = any.getOriginalUploadId() != null ? any.getOriginalUploadId() : any.getId();
+        List<ImageUpload> chain = resolveVersionChain(rootId);
+        return chain.size() > 1 ? chain.get(chain.size() - 1) : null;
     }
 
     /**

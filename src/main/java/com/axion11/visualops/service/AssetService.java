@@ -114,35 +114,17 @@ public class AssetService {
         commentRepository.deleteById(commentId);
     }
 
-    /** Flips the asset's status to "approved" in place, and advances its version number to
-     *  claim the next free slot in its chain — no new row, but an approved version is visibly
-     *  distinguishable from the raw draft it came from (e.g. draft v1 -> approved v2). Later
-     *  edits/approvals keep advancing from wherever the chain's numbering currently sits, so
-     *  the sequence stays gap-free and monotonically increasing either way. */
+    /** Flips the asset's status to "approved" in place — a pure status change. Version number
+     *  and the "established"/VE flag are untouched: the version keeps displaying as VE (see
+     *  ImageUploadService#toDto / the frontend's version-label logic) until an editor does more
+     *  work and a same-name re-upload finalizes it into "v2" (see
+     *  ImageUploadService#findExistingSecondSlot). */
     @Transactional
     public AssetDetailDto approveAsset(String idOrExternalId) {
         ImageUpload upload = findUpload(idOrExternalId);
         upload.setApprovalStatus("approved");
-        upload.setVersionNumber(nextChainVersionNumber(upload));
         imageUploadRepository.save(upload);
         return mapToDto(upload);
-    }
-
-    private int nextChainVersionNumber(ImageUpload upload) {
-        Long rootId = upload.getOriginalUploadId() != null ? upload.getOriginalUploadId() : upload.getId();
-        int maxVersion = imageUploadRepository.findById(rootId)
-                .map(v1 -> v1.getVersionNumber() != null ? v1.getVersionNumber() : 1)
-                .orElse(1);
-        for (ImageUpload sibling : imageUploadRepository.findByOriginalUploadIdOrderByVersionNumberAsc(rootId)) {
-            // Exclude the row being approved from its own "max so far" — a VE row already holds
-            // a provisional number from when it was created (ImageUploadService#syncEditedVersion
-            // assigns one immediately so the chain sorts correctly while still in draft), and
-            // counting that against itself here would inflate v1->v2 into v1->v3 on approval.
-            if (sibling.getId().equals(upload.getId())) continue;
-            int v = sibling.getVersionNumber() != null ? sibling.getVersionNumber() : 1;
-            if (v > maxVersion) maxVersion = v;
-        }
-        return maxVersion + 1;
     }
 
     @Transactional
