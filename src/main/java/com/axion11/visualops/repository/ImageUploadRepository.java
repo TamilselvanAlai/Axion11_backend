@@ -28,6 +28,11 @@ public interface ImageUploadRepository extends JpaRepository<ImageUpload, Long> 
     @EntityGraph(attributePaths = {"tags", "project", "batch", "uploadedBy"})
     List<ImageUpload> findByBatchIdOrderByCreatedAtDesc(Long batchId);
 
+    /** Live count of non-deleted uploads in a batch — used for the folder list's asset count
+     *  instead of Batch#totalImages, which is a denormalized counter that drifts once uploads
+     *  are moved between batches (see ImageUploadService#moveUploadsToBatch). */
+    long countByBatchId(Long batchId);
+
     List<ImageUpload> findByImageQualityQcCheckIsNullOrImageQualityQcCheckNot(String status);
 
     Optional<ImageUpload> findByExternalId(String externalId);

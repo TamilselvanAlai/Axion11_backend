@@ -56,6 +56,13 @@ public interface BatchRepository extends JpaRepository<Batch, Long> {
     @Query("UPDATE Batch b SET b.totalImages = b.totalImages - :count WHERE b.id = :batchId")
     void decrementTotalImages(@Param("batchId") Long batchId, @Param("count") int count);
 
+    /** Plain counter bump with no upload-status side effect — for bookkeeping (e.g. a bulk move
+     *  landing uploads on a batch outside of the upload flow), unlike addTotalImagesAndSetStatus. */
+    @Modifying
+    @Transactional
+    @Query("UPDATE Batch b SET b.totalImages = b.totalImages + :count WHERE b.id = :batchId")
+    void incrementTotalImages(@Param("batchId") Long batchId, @Param("count") int count);
+
     /** Reset upload counters for a new upload session. */
     @Modifying
     @Transactional

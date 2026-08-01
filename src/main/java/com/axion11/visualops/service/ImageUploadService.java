@@ -48,6 +48,7 @@ public class ImageUploadService {
     private final ImageQcService imageQcService;
     private final ProjectAccessService projectAccessService;
     private final ExecutorService imageUploadExecutor;
+    private final BatchEventService batchEventService;
 
     @Value("${gcs.bucket.name}")
     private String bucketName;
@@ -570,17 +571,34 @@ public class ImageUploadService {
         return uploads.stream().map(this::toDto).collect(Collectors.toList());
     }
 
-    /** Moves a set of uploads into a different batch — the upload's project follows the new batch's. */
+    /** Moves a set of uploads into a different batch — the upload's project follows the new batch's.
+     *  Keeps each source/target batch's totalImages counter in sync with the move so it doesn't
+     *  drift out from under the folder list's asset count (see BatchService#toBatchDtoMinimal,
+     *  which now live-counts rather than trusting this counter, but other logic — e.g.
+     *  BatchRepository#completeIfAllUploaded — still depends on it being accurate). */
     @Transactional
     public List<ImageUploadDto> moveUploadsToBatch(List<Long> uploadIds, Long batchId) {
         Batch targetBatch = batchRepository.findById(batchId)
                 .orElseThrow(() -> new NoSuchElementException("Batch not found: " + batchId));
         List<ImageUpload> uploads = imageUploadRepository.findAllById(uploadIds);
+
+        Map<Long, Long> movedOutBySourceBatch = uploads.stream()
+                .filter(u -> u.getBatch() != null && !u.getBatch().getId().equals(batchId))
+                .collect(Collectors.groupingBy(u -> u.getBatch().getId(), Collectors.counting()));
+
         for (ImageUpload upload : uploads) {
             upload.setBatch(targetBatch);
             upload.setProject(targetBatch.getProject());
         }
         imageUploadRepository.saveAll(uploads);
+
+        movedOutBySourceBatch.forEach((sourceBatchId, count) ->
+                batchRepository.decrementTotalImages(sourceBatchId, count.intValue()));
+        int totalMovedIn = movedOutBySourceBatch.values().stream().mapToInt(Long::intValue).sum();
+        if (totalMovedIn > 0) {
+            batchRepository.incrementTotalImages(batchId, totalMovedIn);
+        }
+
         return uploads.stream().map(this::toDto).collect(Collectors.toList());
     }
 
@@ -985,7 +1003,14 @@ public class ImageUploadService {
         // Increment batch upload counter
         if (batchId != null) {
             batchRepository.incrementUploadedImages(batchId);
-            batchRepository.completeIfAllUploaded(batchId);
+            // Push the SSE status event the desktop/web app's upload UI actually waits on (see
+            // BatchService#uploadImagesAsync for the multipart-upload path, which already does
+            // this) — without it, completeIfAllUploaded still flips the row in the DB, but no
+            // connected client is ever told, so the "Processing…" indicator never clears until
+            // its own client-side timeout.
+            if (batchRepository.completeIfAllUploaded(batchId) > 0) {
+                batchEventService.publishStatus(batchId, "COMPLETED");
+            }
         }
 
         Long pid = project != null ? project.getId() : null;

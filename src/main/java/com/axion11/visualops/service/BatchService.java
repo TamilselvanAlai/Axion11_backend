@@ -380,9 +380,12 @@ public class BatchService {
      * List variant used by the folder-browser (desktop app filters this down to a single
      * parent's direct children client-side) — {@link #toDto} would hydrate every ImageUpload
      * (plus tags) for every batch in the project just to populate a nested field callers here
-     * never read, so this uses the minimal mapping instead. {@code totalImages} is still
-     * accurate: it's a running counter maintained by dedicated update queries (see
-     * BatchRepository#addTotalImagesAndSetStatus etc.), not derived from the upload rows.
+     * never read, so this uses the minimal mapping instead. {@code totalImages} is populated
+     * from a live count of the batch's upload rows rather than the {@code Batch#totalImages}
+     * column: that column is a running counter maintained by dedicated update queries (see
+     * BatchRepository#addTotalImagesAndSetStatus etc.) and drifts once uploads are moved
+     * between batches (see ImageUploadService#moveUploadsToBatch, which repoints uploads
+     * without adjusting either batch's counter).
      */
     public List<BatchDto> getBatchesByProject(Long projectId) {
         java.util.Set<Long> allowed = projectAccessService.allowedProjectIds();
@@ -407,7 +410,7 @@ public class BatchService {
                 batch.getParentBatch() != null ? batch.getParentBatch().getId() : null,
                 batch.getStatus(),
                 batch.getUploadStatus(),
-                batch.getTotalImages(),
+                (int) imageUploadRepository.countByBatchId(batch.getId()),
                 batch.getUploadedImages(),
                 batch.getAssignedTo(),
                 batch.getTeam() != null ? batch.getTeam().getId() : null,
