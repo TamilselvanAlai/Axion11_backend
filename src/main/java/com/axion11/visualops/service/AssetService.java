@@ -116,9 +116,11 @@ public class AssetService {
 
     /** Flips the asset's status to "approved" in place — a pure status change. Version number
      *  and the "established"/VE flag are untouched: the version keeps displaying as VE (see
-     *  ImageUploadService#toDto / the frontend's version-label logic) until an editor does more
-     *  work and a same-name re-upload finalizes it into "v2" (see
-     *  ImageUploadService#findExistingSecondSlot). */
+     *  ImageUploadService#toDto / the frontend's version-label logic) indefinitely — nothing
+     *  "finalizes" it into a plain numbered version anymore (see ImageUploadService#
+     *  syncEditedVersion; a plain re-upload of the same filename no longer touches it either,
+     *  see ImageUploadService#confirmDirectUpload). VE is simply the perpetual current-draft
+     *  slot, kept up to date in place by each further edit-and-resync save. */
     @Transactional
     public AssetDetailDto approveAsset(String idOrExternalId) {
         ImageUpload upload = findUpload(idOrExternalId);
@@ -143,6 +145,22 @@ public class AssetService {
             throw new IllegalStateException("Only approved assets can be published live: " + idOrExternalId);
         }
         upload.setApprovalStatus("live");
+        imageUploadRepository.save(upload);
+        return mapToDto(upload);
+    }
+
+    /** Reverses an approval decision — only valid from "approved", never "live": once published,
+     *  the asset is out in front of other systems, and reverting that needs an explicit unpublish
+     *  step, not a silent status flip here. Lands on "revoked" rather than back on "draft" so it
+     *  stays visibly distinguishable from an asset nobody has reviewed yet — same normal
+     *  approve/reject flow applies from there. */
+    @Transactional
+    public AssetDetailDto revokeApproval(String idOrExternalId) {
+        ImageUpload upload = findUpload(idOrExternalId);
+        if (!"approved".equals(upload.getApprovalStatus())) {
+            throw new IllegalStateException("Only approved assets can have their approval revoked: " + idOrExternalId);
+        }
+        upload.setApprovalStatus("revoked");
         imageUploadRepository.save(upload);
         return mapToDto(upload);
     }

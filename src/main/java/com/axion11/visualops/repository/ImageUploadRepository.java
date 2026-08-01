@@ -57,6 +57,20 @@ public interface ImageUploadRepository extends JpaRepository<ImageUpload, Long> 
     /** Uploads with no generated preview yet — candidates for the PSD/RAW/video preview backfill. */
     List<ImageUpload> findByPreviewUrlIsNull();
 
+    /** Every RAW camera upload regardless of whether it already has a preview — unlike
+     *  findByPreviewUrlIsNull, these can need *re*-generation (not just backfilling) when the
+     *  extraction logic itself changes, e.g. the CR3 orientation fix (see
+     *  ImageUploadService#regenerateRawPreviews). */
+    @Query(value = """
+            SELECT * FROM image_uploads
+            WHERE deleted_at IS NULL
+              AND (LOWER(file_name) LIKE '%.cr3' OR LOWER(file_name) LIKE '%.cr2'
+                   OR LOWER(file_name) LIKE '%.nef' OR LOWER(file_name) LIKE '%.arw'
+                   OR LOWER(file_name) LIKE '%.dng' OR LOWER(file_name) LIKE '%.raw')
+            ORDER BY id ASC
+            """, nativeQuery = true)
+    List<ImageUpload> findRawCameraUploads();
+
     /** Case-insensitive file-name substring search, scoped to one project — powers the DAM search bar. */
     @EntityGraph(attributePaths = {"tags", "project", "batch", "uploadedBy"})
     List<ImageUpload> findByProjectIdAndFileNameContainingIgnoreCaseOrderByCreatedAtDesc(Long projectId, String fileName);

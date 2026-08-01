@@ -249,6 +249,18 @@ public class ImageUploadController {
     }
 
     /**
+     * POST /api/uploads/regenerate-raw-previews
+     * Force-regenerates previews for RAW camera uploads (CR3/CR2/NEF/ARW/DNG/RAW) even ones that
+     * already have one — for rolling out a RAW preview pipeline fix (e.g. the CR3 orientation
+     * correction) to files uploaded before it existed, without needing them re-uploaded by hand.
+     */
+    @PostMapping("/regenerate-raw-previews")
+    public ResponseEntity<String> regenerateRawPreviews(@RequestParam(value = "limit", defaultValue = "15") int limit) {
+        int updated = imageUploadService.regenerateRawPreviews(limit);
+        return ResponseEntity.ok("Regenerated previews for " + updated + " uploads");
+    }
+
+    /**
      * PUT /api/uploads/{id}/angle
      * Updates the angle tag for an upload.
      */

@@ -758,6 +758,49 @@ public class ImageUploadService {
         return updated;
     }
 
+    /**
+     * Force-regenerates JPEG previews for existing RAW camera uploads (CR3/CR2/NEF/ARW/DNG/RAW),
+     * even ones that already have a preview — unlike {@link #backfillPreviews}, which only fills
+     * in previews that are missing entirely. Exists because the RAW preview pipeline's own logic
+     * has changed since some of these were first uploaded (most recently: correcting for
+     * orientation via ExifTool — see {@link #resolveOrientation}), so a file that already has a
+     * preview can still have the *wrong* one sitting on disk. Re-downloads each file's original
+     * bytes and re-runs the same extraction used on upload, overwriting whatever preview is
+     * there now.
+     *
+     * Capped at {@code limit} per call for the same reason as backfillPreviews — callers should
+     * keep invoking this until it returns fewer than {@code limit} updates to drain the backlog.
+     */
+    public int regenerateRawPreviews(int limit) {
+        List<ImageUpload> candidates = imageUploadRepository.findRawCameraUploads().stream()
+                .limit(Math.max(1, limit))
+                .toList();
+
+        java.net.http.HttpClient httpClient = java.net.http.HttpClient.newHttpClient();
+        int updated = 0;
+        for (ImageUpload upload : candidates) {
+            try {
+                byte[] bytes = downloadImage(httpClient, upload.getPublicUrl());
+                if (bytes == null) {
+                    log.warn("Preview regen: could not download {} ({})", upload.getFileName(), upload.getId());
+                    continue;
+                }
+                // extractAndSaveMetadata only generates a preview when previewUrl is currently
+                // null (see its RAW fallback branch) — clear it first so an existing (possibly
+                // wrong) preview doesn't make it skip regeneration.
+                upload.setPreviewUrl(null);
+                extractAndSaveMetadata(upload, bytes);
+                if (upload.getPreviewUrl() != null) {
+                    updated++;
+                }
+            } catch (Exception e) {
+                log.error("Preview regen failed for upload {} ({}): {}", upload.getId(), upload.getFileName(), e.getMessage(), e);
+            }
+        }
+        log.info("RAW preview regeneration complete: {}/{} candidates got a fresh preview", updated, candidates.size());
+        return updated;
+    }
+
     // ── Core processing ───────────────────────────────────────────────────────
 
     private ImageUploadDto processSingleUpload(MultipartFile file, Project project, User uploader) throws Exception {
@@ -806,12 +849,13 @@ public class ImageUploadService {
 
     /**
      * Saves an editor's local edit-and-resync as the chain's "VE" (established) version — never
-     * v1, which stays untouched as the original source forever, and never a brand-new row on
-     * every single save either. The rule:
+     * v1, and never any other already-finalized version, both of which stay untouched as
+     * permanent history. The rule:
      *   - If the chain already has an established version, this save replaces its content in
      *     place (same row, same version number) — a second/third/... edit doesn't fork more rows.
-     *   - If the chain has no established version yet (the first edit), a new row is created,
-     *     one slot past the chain's current highest version number, and marked established.
+     *   - Otherwise (no current draft — either this is the first-ever edit, or a previous draft
+     *     was already finalized by approval/re-upload), a new row is created, one slot past the
+     *     chain's current highest version number, and marked established.
      * Either way the result is draft — the version number only actually advances when QC
      * approves it (AssetService#approveAsset already advances-in-place on approval).
      *
@@ -858,14 +902,9 @@ public class ImageUploadService {
                 // Second+ edit — update the existing VE row in place. v1 (and every other
                 // version in the chain) is never touched.
                 target = established;
-            } else if (chain.size() > 1) {
-                // The chain's one extra slot already exists but was finalized into "v2" by a
-                // same-name re-upload (see findExistingSecondSlot/resolveVersion) — reopen it for
-                // editing instead of forking a third row. markEstablished below re-flags it VE.
-                target = chain.get(chain.size() - 1);
             } else {
-                // First-ever edit — v1 stays untouched; the edit becomes the chain's one extra
-                // slot instead of overwriting it.
+                // No current draft — every existing row (v1 and any already-finalized versions)
+                // is permanent history and stays untouched; the edit becomes a brand-new row.
                 ImageUpload v1 = chain.isEmpty() ? anchor : chain.get(0);
                 Long rootId = v1.getOriginalUploadId() != null ? v1.getOriginalUploadId() : v1.getId();
                 int nextVersion = chain.stream()
@@ -946,39 +985,23 @@ public class ImageUploadService {
 
         ImageUpload imageUpload;
         synchronized (versionLockFor(originalFileName, batchId)) {
-            ImageUpload existingSlot = findExistingSecondSlot(originalFileName, batchId);
-
-            if (existingSlot != null) {
-                // Same-name re-upload after edits — overwrite the chain's one extra slot in
-                // place instead of forking v3/v4/v5. This also finalizes it: it's no longer the
-                // "VE" working copy once a fresh file is stacked on top of it.
-                existingSlot.setGcsPath(gcsPath);
-                existingSlot.setPublicUrl(publicUrl);
-                existingSlot.setContentType(contentType);
-                existingSlot.setFileSize(fileSize);
-                existingSlot.setFileName(originalFileName);
-                existingSlot.setUploadedBy(uploader);
-                existingSlot.setCreatedAt(LocalDateTime.now());
-                existingSlot.setApprovalStatus("draft");
-                existingSlot.setImageQualityQcCheck(null);
-                existingSlot.setPreviewUrl(null);
-                existingSlot.setEstablished(false);
-                imageUpload = existingSlot;
-            } else {
-                long[] ver = resolveVersion(originalFileName, batchId);
-                imageUpload = ImageUpload.builder()
-                        .fileName(originalFileName)
-                        .gcsPath(gcsPath)
-                        .publicUrl(publicUrl)
-                        .contentType(contentType)
-                        .fileSize(fileSize)
-                        .project(project)
-                        .uploadedBy(uploader)
-                        .createdAt(LocalDateTime.now())
-                        .versionNumber((int) ver[0])
-                        .originalUploadId(ver[1] < 0 ? null : ver[1])
-                        .build();
-            }
+            // A plain re-upload of a matching filename always becomes a brand-new version — it
+            // must never overwrite an existing row, established (VE) or otherwise, both of which
+            // are permanent history (see syncEditedVersion, which is the only path allowed to
+            // mutate a version's content in place, and only the current VE at that).
+            long[] ver = resolveVersion(originalFileName, batchId);
+            imageUpload = ImageUpload.builder()
+                    .fileName(originalFileName)
+                    .gcsPath(gcsPath)
+                    .publicUrl(publicUrl)
+                    .contentType(contentType)
+                    .fileSize(fileSize)
+                    .project(project)
+                    .uploadedBy(uploader)
+                    .createdAt(LocalDateTime.now())
+                    .versionNumber((int) ver[0])
+                    .originalUploadId(ver[1] < 0 ? null : ver[1])
+                    .build();
 
             if (batchId != null) {
                 Batch batch = batchRepository.findById(batchId).orElse(null);
@@ -1139,39 +1162,22 @@ public class ImageUploadService {
         String publicUrl = "https://storage.googleapis.com/" + bucketName + "/" + fileName;
         ImageUpload imageUpload;
         synchronized (versionLockFor(originalFilename, batchId)) {
-            ImageUpload existingSlot = findExistingSecondSlot(originalFilename, batchId);
-
-            if (existingSlot != null) {
-                // Same-name re-upload after edits — overwrite the chain's one extra slot in
-                // place instead of forking v3/v4/v5. This also finalizes it: it's no longer the
-                // "VE" working copy once a fresh file is stacked on top of it.
-                existingSlot.setGcsPath("gs://" + bucketName + "/" + fileName);
-                existingSlot.setPublicUrl(publicUrl);
-                existingSlot.setContentType(contentType);
-                existingSlot.setFileSize(size);
-                existingSlot.setFileName(originalFilename);
-                existingSlot.setUploadedBy(uploader);
-                existingSlot.setCreatedAt(LocalDateTime.now());
-                existingSlot.setApprovalStatus("draft");
-                existingSlot.setImageQualityQcCheck(null);
-                existingSlot.setPreviewUrl(null);
-                existingSlot.setEstablished(false);
-                imageUpload = existingSlot;
-            } else {
-                long[] ver = resolveVersion(originalFilename, batchId);
-                imageUpload = ImageUpload.builder()
-                        .fileName(originalFilename)
-                        .gcsPath("gs://" + bucketName + "/" + fileName)
-                        .publicUrl(publicUrl)
-                        .contentType(contentType)
-                        .fileSize(size)
-                        .project(project)
-                        .uploadedBy(uploader)
-                        .createdAt(LocalDateTime.now())
-                        .versionNumber((int) ver[0])
-                        .originalUploadId(ver[1] < 0 ? null : ver[1])
-                        .build();
-            }
+            // A plain re-upload of a matching filename always becomes a brand-new version — see
+            // the identical comment in confirmDirectUpload for why this never overwrites an
+            // existing row (established/VE or otherwise).
+            long[] ver = resolveVersion(originalFilename, batchId);
+            imageUpload = ImageUpload.builder()
+                    .fileName(originalFilename)
+                    .gcsPath("gs://" + bucketName + "/" + fileName)
+                    .publicUrl(publicUrl)
+                    .contentType(contentType)
+                    .fileSize(size)
+                    .project(project)
+                    .uploadedBy(uploader)
+                    .createdAt(LocalDateTime.now())
+                    .versionNumber((int) ver[0])
+                    .originalUploadId(ver[1] < 0 ? null : ver[1])
+                    .build();
             imageUpload = imageUploadRepository.save(imageUpload);
         }
 
@@ -1253,39 +1259,22 @@ public class ImageUploadService {
 
         ImageUpload imageUpload;
         synchronized (versionLockFor(originalFilename, batchId)) {
-            ImageUpload existingSlot = findExistingSecondSlot(originalFilename, batchId);
-
-            if (existingSlot != null) {
-                // Same-name re-upload after edits — overwrite the chain's one extra slot in
-                // place instead of forking v3/v4/v5. This also finalizes it: it's no longer the
-                // "VE" working copy once a fresh file is stacked on top of it.
-                existingSlot.setGcsPath(gcsPath);
-                existingSlot.setPublicUrl(publicUrl);
-                existingSlot.setContentType(contentType);
-                existingSlot.setFileSize(size);
-                existingSlot.setFileName(originalFilename);
-                existingSlot.setUploadedBy(uploader);
-                existingSlot.setCreatedAt(LocalDateTime.now());
-                existingSlot.setApprovalStatus("draft");
-                existingSlot.setImageQualityQcCheck(null);
-                existingSlot.setPreviewUrl(null);
-                existingSlot.setEstablished(false);
-                imageUpload = existingSlot;
-            } else {
-                long[] ver = resolveVersion(originalFilename, batchId);
-                imageUpload = ImageUpload.builder()
-                        .fileName(originalFilename)
-                        .gcsPath(gcsPath)
-                        .publicUrl(publicUrl)
-                        .contentType(contentType)
-                        .fileSize(size)
-                        .project(project)
-                        .uploadedBy(uploader)
-                        .createdAt(LocalDateTime.now())
-                        .versionNumber((int) ver[0])
-                        .originalUploadId(ver[1] < 0 ? null : ver[1])
-                        .build();
-            }
+            // A plain re-upload of a matching filename always becomes a brand-new version — see
+            // the identical comment in confirmDirectUpload for why this never overwrites an
+            // existing row (established/VE or otherwise).
+            long[] ver = resolveVersion(originalFilename, batchId);
+            imageUpload = ImageUpload.builder()
+                    .fileName(originalFilename)
+                    .gcsPath(gcsPath)
+                    .publicUrl(publicUrl)
+                    .contentType(contentType)
+                    .fileSize(size)
+                    .project(project)
+                    .uploadedBy(uploader)
+                    .createdAt(LocalDateTime.now())
+                    .versionNumber((int) ver[0])
+                    .originalUploadId(ver[1] < 0 ? null : ver[1])
+                    .build();
             imageUpload = imageUploadRepository.save(imageUpload);
         }
 
@@ -1670,6 +1659,13 @@ public class ImageUploadService {
      * file type (e.g. an unusual PSD/CR3 structure) doesn't skip the more universal byte scan.
      */
     private String extractEmbeddedPreview(byte[] rawBytes, ImageUpload imageUpload) {
+        // RAW camera files store their embedded JPEG preview in the sensor's native orientation
+        // (often landscape, even for a portrait shot) and rely on separate metadata to say how a
+        // viewer should rotate it — read once up front from the full file's metadata and apply to
+        // whichever pass below finds the preview, so extracted CR3/CR2/etc. previews no longer
+        // display sideways/upside down.
+        int orientation = resolveOrientation(rawBytes);
+
         // Pass 1: Exif JPEGInterchangeFormat tags (0x0201/0x0202) — mainly RAW camera files.
         try {
             com.drew.metadata.Metadata metadata = com.drew.imaging.ImageMetadataReader.readMetadata(
@@ -1682,7 +1678,7 @@ public class ImageUploadService {
                     if (offset > 0 && length > 1000 && offset + length <= rawBytes.length) {
                         byte[] jpegBytes = java.util.Arrays.copyOfRange(rawBytes, offset, offset + length);
                         if (jpegBytes.length > 2 && (jpegBytes[0] & 0xFF) == 0xFF && (jpegBytes[1] & 0xFF) == 0xD8) {
-                            String previewUrl = uploadPreviewJpeg(jpegBytes, imageUpload);
+                            String previewUrl = uploadPreviewJpeg(applyExifOrientation(jpegBytes, orientation), imageUpload);
                             log.info("Extracted Exif-tagged preview for {}", imageUpload.getFileName());
                             return previewUrl;
                         }
@@ -1714,7 +1710,7 @@ public class ImageUploadService {
             }
             if (bestOffset >= 0) {
                 byte[] jpegBytes = java.util.Arrays.copyOfRange(rawBytes, bestOffset, bestOffset + bestLength);
-                String previewUrl = uploadPreviewJpeg(jpegBytes, imageUpload);
+                String previewUrl = uploadPreviewJpeg(applyExifOrientation(jpegBytes, orientation), imageUpload);
                 log.info("Extracted JPEG preview from byte scan for {}: {} bytes at offset {}",
                         imageUpload.getFileName(), bestLength, bestOffset);
                 return previewUrl;
@@ -1726,6 +1722,119 @@ public class ImageUploadService {
 
         log.warn("No embedded JPEG preview found in {}", imageUpload.getFileName());
         return null;
+    }
+
+    /** Orientation (1-8, standard TIFF/Exif meaning) resolved via whichever method actually
+     *  works for this file. Tries ExifTool first — a mature external tool that reliably reads
+     *  RAW camera metadata (CR3/CR2/NEF/ARW/etc.) across the wide variety of container structures
+     *  different makes/models/firmware produce, which is why the pure-Java metadata-extractor
+     *  fallback below has historically been unreliable for RAW orientation specifically (an
+     *  earlier attempt at reading a Capture One-injected `<E K="Rotation" V="N"/>` field turned
+     *  out not to be general CR3 metadata at all, just an artifact of files that happened to pass
+     *  through Capture One — removed once ExifTool made that unnecessary). Falls back to the
+     *  standard Exif Orientation tag only if ExifTool itself is unavailable (e.g. a local dev
+     *  environment without it installed — see Dockerfile for where it's installed in prod). */
+    private int resolveOrientation(byte[] rawBytes) {
+        Integer exifToolOrientation = readOrientationViaExifTool(rawBytes);
+        if (exifToolOrientation != null) return exifToolOrientation;
+        return readExifOrientation(rawBytes);
+    }
+
+    /** Shells out to `exiftool -Orientation -n -s3 <file>`, which prints just the numeric Exif
+     *  orientation (1-8) with no other output to parse. Returns null — not a thrown error — if
+     *  the binary is missing, the process times out, or the file has no orientation tag, so
+     *  {@link #resolveOrientation} can fall back instead of failing preview generation outright. */
+    private Integer readOrientationViaExifTool(byte[] rawBytes) {
+        java.io.File tempFile = null;
+        Process process = null;
+        try {
+            tempFile = java.io.File.createTempFile("axion-orientation-", ".raw");
+            try (java.io.FileOutputStream out = new java.io.FileOutputStream(tempFile)) {
+                out.write(rawBytes);
+            }
+
+            process = new ProcessBuilder("exiftool", "-Orientation", "-n", "-s3", tempFile.getAbsolutePath())
+                    .redirectErrorStream(true)
+                    .start();
+
+            String output;
+            try (java.io.BufferedReader reader =
+                         new java.io.BufferedReader(new java.io.InputStreamReader(process.getInputStream()))) {
+                output = reader.readLine();
+            }
+
+            if (!process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) {
+                return null;
+            }
+            return output != null ? Integer.parseInt(output.trim()) : null;
+        } catch (Exception e) {
+            log.warn("ExifTool orientation lookup failed ({}), falling back to metadata-extractor", e.getMessage());
+            return null;
+        } finally {
+            if (process != null) process.destroyForcibly();
+            if (tempFile != null && !tempFile.delete()) {
+                tempFile.deleteOnExit();
+            }
+        }
+    }
+
+    /** EXIF Orientation tag (1-8, standard TIFF/Exif meaning), or 1 ("normal", no correction
+     *  needed) if it's missing or unreadable. Scans every directory for the raw tag number
+     *  (0x0112) rather than trusting it to live in {@code ExifIFD0Directory} specifically — the
+     *  same reason the embedded-preview search above scans by tag number across every directory
+     *  instead of one fixed type: CR3's ISO-BMFF-based container doesn't necessarily surface its
+     *  Exif data the way metadata-extractor represents classic TIFF-structured RAW formats
+     *  (CR2/NEF/ARW), so a directory-type-specific lookup can silently find nothing for it. */
+    private int readExifOrientation(byte[] rawBytes) {
+        try {
+            com.drew.metadata.Metadata metadata = com.drew.imaging.ImageMetadataReader.readMetadata(
+                    new java.io.ByteArrayInputStream(rawBytes));
+            for (com.drew.metadata.Directory dir : metadata.getDirectories()) {
+                if (dir.containsTag(0x0112)) {
+                    return dir.getInt(0x0112);
+                }
+            }
+        } catch (Exception e) {
+            log.warn("Failed to read EXIF orientation: {}", e.getMessage());
+        }
+        return 1;
+    }
+
+    /** Physically rotates/flips preview bytes to match the source file's EXIF Orientation tag
+     *  (standard 1-8 values). No-ops (returns the original bytes) for orientation 1 or if
+     *  anything about the correction fails — showing a sideways preview beats showing none. */
+    private byte[] applyExifOrientation(byte[] jpegBytes, int orientation) {
+        if (orientation <= 1) return jpegBytes;
+        try {
+            java.awt.image.BufferedImage image = javax.imageio.ImageIO.read(new java.io.ByteArrayInputStream(jpegBytes));
+            if (image == null) return jpegBytes;
+
+            int width = image.getWidth();
+            int height = image.getHeight();
+            java.awt.geom.AffineTransform t = new java.awt.geom.AffineTransform();
+            switch (orientation) {
+                case 2 -> { t.scale(-1.0, 1.0); t.translate(-width, 0); }
+                case 3 -> { t.translate(width, height); t.rotate(Math.PI); }
+                case 4 -> { t.scale(1.0, -1.0); t.translate(0, -height); }
+                case 5 -> { t.rotate(-Math.PI / 2); t.scale(-1.0, 1.0); }
+                case 6 -> { t.translate(height, 0); t.rotate(Math.PI / 2); }
+                case 7 -> { t.scale(-1.0, 1.0); t.translate(-height, 0); t.translate(0, width); t.rotate(3 * Math.PI / 2); }
+                case 8 -> { t.translate(0, width); t.rotate(3 * Math.PI / 2); }
+                default -> { return jpegBytes; }
+            }
+
+            java.awt.image.AffineTransformOp op =
+                    new java.awt.image.AffineTransformOp(t, java.awt.image.AffineTransformOp.TYPE_BILINEAR);
+            java.awt.image.BufferedImage destination = op.createCompatibleDestImage(image, null);
+            op.filter(image, destination);
+
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            javax.imageio.ImageIO.write(destination, "jpg", out);
+            return out.toByteArray();
+        } catch (Exception e) {
+            log.warn("EXIF orientation correction failed, using unrotated preview: {}", e.getMessage());
+            return jpegBytes;
+        }
     }
 
     /** Uploads a JPEG preview to GCS, also setting width/height from its own dimensions, and returns its public URL. */
@@ -2548,31 +2657,6 @@ public class ImageUploadService {
     }
 
     /**
-     * The chain's existing "second slot" row for a same-named file in this batch — the one extra
-     * row beyond v1, which is "VE" while {@code established} and becomes the final "v2" once a
-     * same-name re-upload lands on it — or null if only v1 exists so far (or no match at all).
-     * Chains are capped at this one extra row: a plain re-upload of a matching filename overwrites
-     * it in place instead of forking a new v3/v4/v5, mirroring how {@link #syncEditedVersion}
-     * already overwrites it in place across repeated edits.
-     */
-    private ImageUpload findExistingSecondSlot(String fileName, Long batchId) {
-        if (batchId == null) return null;
-        List<ImageUpload> existing = imageUploadRepository
-                .findByFileNameAndBatchIdOrderByVersionNumberDesc(fileName, batchId);
-        if (existing.isEmpty()) {
-            String baseName = stripExtension(fileName);
-            existing = imageUploadRepository.findByBatchIdOrderByCreatedAtDesc(batchId).stream()
-                    .filter(u -> stripExtension(u.getFileName()).equalsIgnoreCase(baseName))
-                    .toList();
-        }
-        if (existing.isEmpty()) return null;
-        ImageUpload any = existing.get(0);
-        Long rootId = any.getOriginalUploadId() != null ? any.getOriginalUploadId() : any.getId();
-        List<ImageUpload> chain = resolveVersionChain(rootId);
-        return chain.size() > 1 ? chain.get(chain.size() - 1) : null;
-    }
-
-    /**
      * Returns [versionNumber, originalUploadId] for a new upload.
      * -1 in position 1 means originalUploadId should be null (i.e. this is the first version).
      */
@@ -2594,8 +2678,18 @@ public class ImageUploadService {
         }
         if (existing.isEmpty()) return new long[]{1L, -1L};
         ImageUpload latest = existing.get(0);
-        long nextVer = (latest.getVersionNumber() != null ? latest.getVersionNumber() : 1) + 1L;
         long origId = latest.getOriginalUploadId() != null ? latest.getOriginalUploadId() : latest.getId();
+
+        // VE (established) is a perpetual draft slot, not a step in the v1/v2/v3... sequence —
+        // a fresh finalized upload lands right after the highest *finalized* version, regardless
+        // of whatever internal version number VE's own row happens to hold (it was assigned once
+        // when VE was created and is never shown — the frontend always displays an established
+        // row as "VE" — so it must never determine the next finalized number).
+        long nextVer = existing.stream()
+                .filter(u -> !u.isEstablished())
+                .mapToLong(u -> u.getVersionNumber() != null ? u.getVersionNumber() : 1)
+                .max().orElse(0) + 1L;
+
         return new long[]{nextVer, origId};
     }
 

@@ -89,4 +89,14 @@ public class AssetController {
             return ResponseEntity.badRequest().body(e.getMessage());
         }
     }
+
+    @PostMapping("/{id}/revoke-approval")
+    @PreAuthorize("hasAnyRole('SUPER_ADMIN', 'ADMIN', 'CREATIVE_LEAD', 'REVIEWER', 'CLIENT')")
+    public ResponseEntity<?> revokeApproval(@PathVariable("id") String id) {
+        try {
+            return ResponseEntity.ok(assetService.revokeApproval(id));
+        } catch (IllegalStateException e) {
+            return ResponseEntity.badRequest().body(e.getMessage());
+        }
+    }
 }
