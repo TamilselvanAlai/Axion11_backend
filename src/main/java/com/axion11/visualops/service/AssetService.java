@@ -151,16 +151,16 @@ public class AssetService {
 
     /** Reverses an approval decision — only valid from "approved", never "live": once published,
      *  the asset is out in front of other systems, and reverting that needs an explicit unpublish
-     *  step, not a silent status flip here. Lands on "revoked" rather than back on "draft" so it
-     *  stays visibly distinguishable from an asset nobody has reviewed yet — same normal
-     *  approve/reject flow applies from there. */
+     *  step, not a silent status flip here. Lands back on "draft" (displays as "Pending"), the
+     *  same starting state as before anyone reviewed it — same normal approve/reject flow applies
+     *  from there. */
     @Transactional
     public AssetDetailDto revokeApproval(String idOrExternalId) {
         ImageUpload upload = findUpload(idOrExternalId);
         if (!"approved".equals(upload.getApprovalStatus())) {
             throw new IllegalStateException("Only approved assets can have their approval revoked: " + idOrExternalId);
         }
-        upload.setApprovalStatus("revoked");
+        upload.setApprovalStatus("draft");
         imageUploadRepository.save(upload);
         return mapToDto(upload);
     }

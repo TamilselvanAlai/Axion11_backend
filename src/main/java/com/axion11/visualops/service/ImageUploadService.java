@@ -1641,8 +1641,13 @@ public class ImageUploadService {
             javax.imageio.ImageIO.write(rgbImage, "jpg", baos);
             byte[] jpegBytes = baos.toByteArray();
 
-            // Upload to GCS under previews/ prefix
-            String previewFileName = "previews/" + imageUpload.getId() + "_preview.jpg";
+            // Upload to GCS under previews/ prefix. Includes a timestamp, not just the upload's
+            // id, so a VE re-save (which regenerates the preview at the *same* id every time —
+            // see syncEditedVersion) gets a genuinely new URL instead of overwriting the same
+            // GCS object path each time: browsers (and GCS's own edge caching) were caching the
+            // first-ever preview indefinitely against that stable URL, so only the very first
+            // save's thumbnail was ever visible no matter how many times it was resaved.
+            String previewFileName = "previews/" + imageUpload.getId() + "_" + System.currentTimeMillis() + "_preview.jpg";
             uploadToGcs(previewFileName, jpegBytes, "image/jpeg");
             return "https://storage.googleapis.com/" + bucketName + "/" + previewFileName;
         } catch (Exception e) {
@@ -1811,6 +1816,10 @@ public class ImageUploadService {
 
             int width = image.getWidth();
             int height = image.getHeight();
+            boolean swapsDimensions = orientation >= 5;
+            int destWidth = swapsDimensions ? height : width;
+            int destHeight = swapsDimensions ? width : height;
+
             java.awt.geom.AffineTransform t = new java.awt.geom.AffineTransform();
             switch (orientation) {
                 case 2 -> { t.scale(-1.0, 1.0); t.translate(-width, 0); }
@@ -1823,13 +1832,25 @@ public class ImageUploadService {
                 default -> { return jpegBytes; }
             }
 
+            // Explicitly RGB (no alpha) rather than op.createCompatibleDestImage(image, null) —
+            // AffineTransformOp can pick an ARGB destination for a rotation even though nothing
+            // about a 90/180/270° turn of a fully-opaque JPEG source actually needs transparency.
+            // JPEG has no writer for an alpha-carrying image; ImageIO.write() doesn't throw when
+            // it can't find one, it just returns false and leaves the output stream empty — which
+            // is exactly how this was silently producing a "successful" but 0-byte preview file
+            // (uploaded fine, previewUrl set on the row, nothing actually renderable at that URL).
+            java.awt.image.BufferedImage destination =
+                    new java.awt.image.BufferedImage(destWidth, destHeight, java.awt.image.BufferedImage.TYPE_INT_RGB);
             java.awt.image.AffineTransformOp op =
                     new java.awt.image.AffineTransformOp(t, java.awt.image.AffineTransformOp.TYPE_BILINEAR);
-            java.awt.image.BufferedImage destination = op.createCompatibleDestImage(image, null);
             op.filter(image, destination);
 
             java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
-            javax.imageio.ImageIO.write(destination, "jpg", out);
+            boolean wrote = javax.imageio.ImageIO.write(destination, "jpg", out);
+            if (!wrote || out.size() == 0) {
+                log.warn("No JPEG writer produced output for rotated preview (orientation {}), using unrotated bytes", orientation);
+                return jpegBytes;
+            }
             return out.toByteArray();
         } catch (Exception e) {
             log.warn("EXIF orientation correction failed, using unrotated preview: {}", e.getMessage());
@@ -1837,7 +1858,10 @@ public class ImageUploadService {
         }
     }
 
-    /** Uploads a JPEG preview to GCS, also setting width/height from its own dimensions, and returns its public URL. */
+    /** Uploads a JPEG preview to GCS, also setting width/height from its own dimensions, and
+     *  returns its public URL. Filename includes a timestamp, not just the upload's id — see the
+     *  identical comment in generateAndUploadPreview for why: a stable per-id URL meant re-saves
+     *  of the same VE row silently kept serving the first-ever cached preview forever. */
     private String uploadPreviewJpeg(byte[] jpegBytes, ImageUpload imageUpload) {
         try {
             java.awt.image.BufferedImage previewImg = javax.imageio.ImageIO.read(new java.io.ByteArrayInputStream(jpegBytes));
@@ -1847,7 +1871,7 @@ public class ImageUploadService {
             }
         } catch (Exception ignore) {}
 
-        String previewFileName = "previews/" + imageUpload.getId() + "_preview.jpg";
+        String previewFileName = "previews/" + imageUpload.getId() + "_" + System.currentTimeMillis() + "_preview.jpg";
         uploadToGcs(previewFileName, jpegBytes, "image/jpeg");
         return "https://storage.googleapis.com/" + bucketName + "/" + previewFileName;
     }
