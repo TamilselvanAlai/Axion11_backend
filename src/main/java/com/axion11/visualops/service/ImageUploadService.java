@@ -817,12 +817,46 @@ public class ImageUploadService {
     }
 
     /**
-     * Generates a signed URL for direct browser-to-GCS upload.
-     * Uses service account credentials when available (Cloud Run), throws if not (local dev).
+     * Generates a signed URL for direct browser-to-GCS upload — the only path that isn't capped
+     * by Cloud Run's ~32MB request-body limit, so every file (any size) must go through this,
+     * never the direct-multipart fallback, in production.
+     *
+     * Cloud Run's attached service account has no downloadable private key, and
+     * {@code Storage#signUrl} needs one to sign locally — on a bare {@link ComputeEngineCredentials}
+     * it throws ("Signing key not available"). The fix is to impersonate that *same* service
+     * account via the IAM Credentials API (signBlob), which works without a key file. This
+     * requires the runtime service account to hold roles/iam.serviceAccountTokenCreator on
+     * itself; see deploy_backend_prod.ps1 / README for the one-time
+     * `gcloud iam service-accounts add-iam-policy-binding` setup.
      */
     public Map<String, String> generateSignedUploadUrl(String originalFileName, String contentType) {
+        // Validated outside the try/catch below on purpose: that catch maps every failure
+        // (including a real signing error) to {"supported": "false"}, which the frontend reads
+        // as "fall back to the multipart endpoint" — an unsupported file type must instead
+        // surface as an explicit 400 (via IllegalArgumentException -> GlobalExceptionHandler),
+        // not get silently retried on a different upload path.
+        validateUploadExtension(originalFileName);
         try {
-            Storage storage = StorageOptions.getDefaultInstance().getService();
+            com.google.auth.oauth2.GoogleCredentials sourceCredentials =
+                    com.google.auth.oauth2.GoogleCredentials.getApplicationDefault();
+            Storage storage;
+            if (sourceCredentials instanceof com.google.auth.oauth2.ComputeEngineCredentials) {
+                String serviceAccountEmail =
+                        ((com.google.auth.oauth2.ComputeEngineCredentials) sourceCredentials).getAccount();
+                com.google.auth.oauth2.ImpersonatedCredentials signingCredentials =
+                        com.google.auth.oauth2.ImpersonatedCredentials.create(
+                                sourceCredentials,
+                                serviceAccountEmail,
+                                null,
+                                Collections.singletonList("https://www.googleapis.com/auth/cloud-platform"),
+                                300);
+                storage = StorageOptions.newBuilder().setCredentials(signingCredentials).build().getService();
+            } else {
+                // Local dev with a downloaded service-account key file (has its own private
+                // key) — can sign directly, no impersonation needed.
+                storage = StorageOptions.getDefaultInstance().getService();
+            }
+
             String gcsFileName = UUID.randomUUID() + "_" + originalFileName;
             BlobInfo blobInfo = BlobInfo.newBuilder(BlobId.of(bucketName, gcsFileName))
                     .setContentType(contentType)
@@ -839,7 +873,8 @@ public class ImageUploadService {
                     "publicUrl", "https://storage.googleapis.com/" + bucketName + "/" + gcsFileName
             );
         } catch (Exception e) {
-            log.warn("Failed to generate GCS signed URL (likely local dev without service account key): {}", e.getMessage());
+            log.warn("Failed to generate GCS signed URL (likely local dev without service account key, or " +
+                    "missing roles/iam.serviceAccountTokenCreator self-binding in production): {}", e.getMessage());
             return Map.of(
                     "supported", "false",
                     "error", e.getMessage() != null ? e.getMessage() : "Unknown error"
@@ -977,6 +1012,10 @@ public class ImageUploadService {
      */
     public ImageUploadDto confirmDirectUpload(String gcsFileName, String originalFileName, String contentType,
                                                long fileSize, Long projectId, Long batchId, String uploaderEmail) {
+        // Defense in depth: generateSignedUploadUrl already rejected an unsupported extension
+        // before handing out a write URL, but this call is a separate, independently-reachable
+        // endpoint — re-check here too rather than trusting the earlier step was actually used.
+        validateUploadExtension(originalFileName);
         User uploader = userRepository.findByEmail(uploaderEmail).orElse(null);
         Project project = projectId != null ? projectRepository.findById(projectId).orElse(null) : null;
 
@@ -1149,6 +1188,7 @@ public class ImageUploadService {
     }
 
     public ImageUploadDto uploadImageFastFromFile(String originalFilename, String contentType, long size, java.io.File tempFile, Long projectId, String uploaderEmail, Long batchId) {
+        validateUploadExtension(originalFilename);
         User uploader = userRepository.findByEmail(uploaderEmail).orElse(null);
         Project project = projectId != null ? projectRepository.findById(projectId).orElse(null) : null;
 
@@ -1252,6 +1292,7 @@ public class ImageUploadService {
     }
 
     private ImageUploadDto uploadToGcsAndSave(String originalFilename, String contentType, long size, byte[] bytes, Project project, User uploader, Long batchId) {
+        validateUploadExtension(originalFilename);
         String fileName = UUID.randomUUID() + "_" + originalFilename;
 
         String gcsPath = uploadToGcs(fileName, bytes, contentType);
@@ -1291,6 +1332,7 @@ public class ImageUploadService {
     }
 
     private ImageUploadDto processUpload(String originalFilename, String contentType, long size, byte[] bytes, Project project, User uploader) {
+        validateUploadExtension(originalFilename);
         String fileName = UUID.randomUUID() + "_" + originalFilename;
 
         String gcsPath = uploadToGcs(fileName, bytes, contentType);
@@ -1512,6 +1554,49 @@ public class ImageUploadService {
         imageUploadRepository.save(imageUpload);
     }
 
+    // ── Upload validation ────────────────────────────────────────────────────
+
+    /** Every extension the app recognizes as an uploadable asset — kept in sync with the
+     *  frontend's file-picker `accept` list and FTP-browse filter (UploadAssets.tsx) so a file a
+     *  user can select in the UI is never then rejected server-side, and vice versa. This is the
+     *  one real enforcement point: client-side `accept` attributes are just UI hints (bypassable
+     *  via drag-and-drop or an OS "All Files" picker), so every upload entry point below calls
+     *  {@link #validateUploadExtension} before any bytes reach GCS or a DB row is created. */
+    private static final Set<String> ALLOWED_UPLOAD_EXTENSIONS = Set.of(
+            // images
+            "jpg", "jpeg", "png", "webp", "tif", "tiff", "gif", "bmp", "svg",
+            // design/prepress
+            "eps", "ai", "psd",
+            // RAW — same set as NEEDS_PREVIEW_EXTS's RAW extensions
+            "raw", "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "dng", "raf",
+            "rw2", "rwl", "orf", "pef", "ptx", "srw", "x3f", "3fr", "fff", "iiq", "mef",
+            "mos", "erf", "kdc", "dcr", "mrw", "gpr",
+            // modern image containers
+            "heic", "heif", "avif",
+            // video
+            "mp4", "mov", "avi", "mkv", "wmv", "flv", "webm", "m4v", "mpg", "mpeg",
+            // documents
+            "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv",
+            // 3D
+            "obj", "fbx", "gltf", "glb", "stl", "3ds", "dae", "blend", "usdz",
+            // archives
+            "zip"
+    );
+
+    /** Rejects an upload whose extension isn't in {@link #ALLOWED_UPLOAD_EXTENSIONS} — thrown as
+     *  {@link IllegalArgumentException} so {@code GlobalExceptionHandler} turns it into a 400
+     *  with this message, rather than a file type silently reaching GCS or the DB. */
+    private void validateUploadExtension(String fileName) {
+        if (fileName == null) {
+            throw new IllegalArgumentException("File name is required");
+        }
+        int dot = fileName.lastIndexOf('.');
+        String ext = dot >= 0 ? fileName.substring(dot + 1).toLowerCase() : "";
+        if (ext.isEmpty() || !ALLOWED_UPLOAD_EXTENSIONS.contains(ext)) {
+            throw new IllegalArgumentException("Unsupported file type: ." + ext + " (" + fileName + ")");
+        }
+    }
+
     // ── Preview generation ─────────────────────────────────────────────────────
 
     /** Content types recognized well enough to rewrite a file name's extension for. */
@@ -1547,9 +1632,58 @@ public class ImageUploadService {
         return base + "." + newExt;
     }
 
-    /** Extensions that browsers cannot render natively — need a JPEG preview. */
+    /** Extensions that browsers cannot render natively — need a JPEG preview.
+     *
+     *  The RAW half of this set is intentionally the full known camera-RAW extension landscape
+     *  (every current DSLR/mirrorless/medium-format manufacturer), not just the formats we've
+     *  been asked to support so far. extractEmbeddedPreview() doesn't parse any vendor-specific
+     *  RAW structure — it just pulls the JPEG every RAW file already embeds (via Exif preview
+     *  tags, or a raw byte scan as fallback), so any format in this set works automatically with
+     *  no other code change. That's also why we list extensions explicitly here instead of
+     *  content-sniffing unrecognized uploads for an embedded JPEG: PDFs, DOCX/PPTX and other
+     *  office formats routinely embed JPEGs internally too, and sniffing every upload would start
+     *  generating bogus "previews" for those. A new camera RAW extension not yet in this list
+     *  just needs adding here — everything downstream picks it up unchanged. */
     private static final Set<String> NEEDS_PREVIEW_EXTS = Set.of(
-            "psd", "ai", "eps", "tif", "tiff", "raw", "cr2", "cr3", "nef", "arw", "dng", "heic", "heif"
+            "psd", "ai", "eps", "tif", "tiff", "heic", "heif",
+            // Canon
+            "cr2", "cr3", "crw",
+            // Nikon
+            "nef", "nrw",
+            // Sony
+            "arw", "srf", "sr2",
+            // Adobe / generic DNG-based
+            "dng",
+            // Fujifilm
+            "raf",
+            // Generic/other TIFF-based RAW
+            "raw",
+            // Panasonic / Leica
+            "rw2", "rwl",
+            // Olympus
+            "orf",
+            // Pentax
+            "pef", "ptx",
+            // Samsung
+            "srw",
+            // Sigma
+            "x3f",
+            // Hasselblad / Imacon
+            "3fr", "fff",
+            // Phase One
+            "iiq",
+            // Mamiya
+            "mef",
+            // Leaf
+            "mos",
+            // Epson
+            "erf",
+            // Kodak
+            "kdc", "dcr",
+            // Minolta
+            "mrw",
+            // GoPro
+            "gpr"
     );
 
     private boolean needsPreview(String fileName) {
@@ -1682,7 +1816,8 @@ public class ImageUploadService {
                     int length = dir.getInt(0x0202);
                     if (offset > 0 && length > 1000 && offset + length <= rawBytes.length) {
                         byte[] jpegBytes = java.util.Arrays.copyOfRange(rawBytes, offset, offset + length);
-                        if (jpegBytes.length > 2 && (jpegBytes[0] & 0xFF) == 0xFF && (jpegBytes[1] & 0xFF) == 0xD8) {
+                        if (jpegBytes.length > 2 && (jpegBytes[0] & 0xFF) == 0xFF && (jpegBytes[1] & 0xFF) == 0xD8
+                                && isDecodableJpeg(jpegBytes)) {
                             String previewUrl = uploadPreviewJpeg(applyExifOrientation(jpegBytes, orientation), imageUpload);
                             log.info("Extracted Exif-tagged preview for {}", imageUpload.getFileName());
                             return previewUrl;
@@ -1695,29 +1830,38 @@ public class ImageUploadService {
                     imageUpload.getFileName(), e.getMessage());
         }
 
-        // Pass 2: brute-force scan for the largest embedded JPEG segment (FFD8...FFD9). Works
+        // Pass 2: brute-force scan for embedded JPEG segments (FFD8...FFD9), largest first. Works
         // for PSD/AI thumbnail resources and any RAW variant regardless of container structure.
+        // Candidates are validated by actually decoding them (see isDecodableJpeg) rather than
+        // trusting the largest byte-8/FFD9 span found — RAW sensor data is high-entropy enough
+        // that it can coincidentally contain a byte pair that merely *looks* like JPEG start/end
+        // markers without being a real image, which used to get uploaded as the preview anyway
+        // (uploadPreviewJpeg swallows its own ImageIO.read failure — it's only used there to
+        // grab width/height, not to gate the upload), producing a previewUrl that no viewer,
+        // including this app's own thumbnail renderer, could ever actually display.
         try {
-            int bestOffset = -1, bestLength = 0;
+            List<int[]> candidates = new ArrayList<>(); // [offset, length]
             for (int i = 0; i < rawBytes.length - 3; i++) {
                 if ((rawBytes[i] & 0xFF) == 0xFF && (rawBytes[i + 1] & 0xFF) == 0xD8) {
                     for (int j = i + 2; j < rawBytes.length - 1; j++) {
                         if ((rawBytes[j] & 0xFF) == 0xFF && (rawBytes[j + 1] & 0xFF) == 0xD9) {
                             int len = j - i + 2;
-                            if (len > bestLength && len > 10000) { // Only consider JPEGs > 10KB
-                                bestOffset = i;
-                                bestLength = len;
+                            if (len > 10000) { // Only consider JPEGs > 10KB
+                                candidates.add(new int[]{i, len});
                             }
                             break;
                         }
                     }
                 }
             }
-            if (bestOffset >= 0) {
-                byte[] jpegBytes = java.util.Arrays.copyOfRange(rawBytes, bestOffset, bestOffset + bestLength);
+            candidates.sort((a, b) -> b[1] - a[1]);
+
+            for (int[] candidate : candidates) {
+                byte[] jpegBytes = java.util.Arrays.copyOfRange(rawBytes, candidate[0], candidate[0] + candidate[1]);
+                if (!isDecodableJpeg(jpegBytes)) continue;
                 String previewUrl = uploadPreviewJpeg(applyExifOrientation(jpegBytes, orientation), imageUpload);
                 log.info("Extracted JPEG preview from byte scan for {}: {} bytes at offset {}",
-                        imageUpload.getFileName(), bestLength, bestOffset);
+                        imageUpload.getFileName(), candidate[1], candidate[0]);
                 return previewUrl;
             }
         } catch (Exception e) {
@@ -1727,6 +1871,18 @@ public class ImageUploadService {
 
         log.warn("No embedded JPEG preview found in {}", imageUpload.getFileName());
         return null;
+    }
+
+    /** Whether {@code bytes} actually decodes as a real image, not just something that starts
+     *  with FFD8 and ends with FFD9 — see the Pass 2 comment above for why that byte-level check
+     *  alone isn't trustworthy for a preview extracted out of raw sensor data. */
+    private boolean isDecodableJpeg(byte[] bytes) {
+        try {
+            java.awt.image.BufferedImage img = javax.imageio.ImageIO.read(new java.io.ByteArrayInputStream(bytes));
+            return img != null && img.getWidth() > 0 && img.getHeight() > 0;
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     /** Orientation (1-8, standard TIFF/Exif meaning) resolved via whichever method actually

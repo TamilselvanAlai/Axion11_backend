@@ -37,8 +37,10 @@ public class CloudSyncService {
     private static final Set<String> ALLOWED_EXTENSIONS = Set.of(
             // images
             "jpg", "jpeg", "png", "webp", "gif", "heic", "heif", "tiff", "tif", "bmp",
-            // raw
-            "cr2", "cr3", "nef", "arw", "dng", "raf", "orf", "rw2",
+            // raw — kept in sync with ImageUploadService.NEEDS_PREVIEW_EXTS' RAW extensions
+            "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "dng", "raf", "raw",
+            "rw2", "rwl", "orf", "pef", "ptx", "srw", "x3f", "3fr", "fff", "iiq", "mef",
+            "mos", "erf", "kdc", "dcr", "mrw", "gpr",
             // videos
             "mp4", "mov", "avi", "mkv", "webm", "m4v", "mpg", "mpeg", "wmv"
     );

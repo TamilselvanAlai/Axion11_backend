@@ -64,9 +64,24 @@ public interface ImageUploadRepository extends JpaRepository<ImageUpload, Long> 
     @Query(value = """
             SELECT * FROM image_uploads
             WHERE deleted_at IS NULL
-              AND (LOWER(file_name) LIKE '%.cr3' OR LOWER(file_name) LIKE '%.cr2'
-                   OR LOWER(file_name) LIKE '%.nef' OR LOWER(file_name) LIKE '%.arw'
-                   OR LOWER(file_name) LIKE '%.dng' OR LOWER(file_name) LIKE '%.raw')
+              AND (LOWER(file_name) LIKE '%.cr3' OR LOWER(file_name) LIKE '%.cr2' OR LOWER(file_name) LIKE '%.crw'
+                   OR LOWER(file_name) LIKE '%.nef' OR LOWER(file_name) LIKE '%.nrw'
+                   OR LOWER(file_name) LIKE '%.arw' OR LOWER(file_name) LIKE '%.srf' OR LOWER(file_name) LIKE '%.sr2'
+                   OR LOWER(file_name) LIKE '%.dng'
+                   OR LOWER(file_name) LIKE '%.raf' OR LOWER(file_name) LIKE '%.raw'
+                   OR LOWER(file_name) LIKE '%.rw2' OR LOWER(file_name) LIKE '%.rwl'
+                   OR LOWER(file_name) LIKE '%.orf'
+                   OR LOWER(file_name) LIKE '%.pef' OR LOWER(file_name) LIKE '%.ptx'
+                   OR LOWER(file_name) LIKE '%.srw'
+                   OR LOWER(file_name) LIKE '%.x3f'
+                   OR LOWER(file_name) LIKE '%.3fr' OR LOWER(file_name) LIKE '%.fff'
+                   OR LOWER(file_name) LIKE '%.iiq'
+                   OR LOWER(file_name) LIKE '%.mef'
+                   OR LOWER(file_name) LIKE '%.mos'
+                   OR LOWER(file_name) LIKE '%.erf'
+                   OR LOWER(file_name) LIKE '%.kdc' OR LOWER(file_name) LIKE '%.dcr'
+                   OR LOWER(file_name) LIKE '%.mrw'
+                   OR LOWER(file_name) LIKE '%.gpr')
             ORDER BY id ASC
             """, nativeQuery = true)
     List<ImageUpload> findRawCameraUploads();
