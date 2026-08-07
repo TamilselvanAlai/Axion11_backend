@@ -20,7 +20,13 @@ public interface AssetEditSessionRepository extends JpaRepository<AssetEditSessi
     List<AssetEditSession> findByUserIdAndStartedAtBetweenAndEndedAtIsNotNullOrderByEndedAtDesc(
             Long userId, LocalDateTime start, LocalDateTime end);
 
+    /** All users' closed sessions in range — backs the weekly/monthly report and payroll rollup,
+     *  which (unlike getToday) aren't scoped to a single user by default. */
+    List<AssetEditSession> findByStartedAtBetweenAndEndedAtIsNotNull(LocalDateTime start, LocalDateTime end);
+
     List<AssetEditSession> findByImageUploadIdAndEndedAtIsNotNull(Long imageUploadId);
+
+    List<AssetEditSession> findByImageUploadIdInAndEndedAtIsNotNull(Collection<Long> imageUploadIds);
 
     @Modifying
     @Transactional

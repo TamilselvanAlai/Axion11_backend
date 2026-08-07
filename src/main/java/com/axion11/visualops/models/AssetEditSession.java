@@ -43,8 +43,19 @@ public class AssetEditSession {
     @Column(length = 20)
     private String endReason;
 
+    /** Idle-corrected active seconds, accumulated one tick at a time while this session is open
+     *  (see AssetEditSessionService#tick) — only ticks where the client reported real system
+     *  input within the idle threshold (10 min) get added. This is the authoritative "time
+     *  actually spent editing this asset" figure; {@code endedAt - startedAt} is kept only as the
+     *  wall-clock open/close range for display, not as the duration itself, since it would
+     *  otherwise include however long the user was away from the keyboard mid-session. */
+    @Builder.Default
+    @Column(nullable = false)
+    private Long activeSeconds = 0L;
+
     @PrePersist
     protected void onCreate() {
         if (startedAt == null) startedAt = LocalDateTime.now();
+        if (activeSeconds == null) activeSeconds = 0L;
     }
 }

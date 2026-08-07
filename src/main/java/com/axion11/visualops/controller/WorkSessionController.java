@@ -9,10 +9,14 @@ import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.Map;
+
 /** Backs the dashboard's "Assets Edited Today" / "Active Editing Time" cards with real
  *  login-to-logout activity instead of static placeholders. The frontend starts a session on
- *  login, sends a heartbeat while the app stays open, records an edit whenever a locally-opened
- *  asset re-syncs after being changed in a 3rd-party app, and ends the session on logout/close. */
+ *  login, sends a heartbeat every ~30s while the app stays open (reporting whether the OS-wide
+ *  idle clock crossed the idle threshold since the last tick), records an edit whenever a
+ *  locally-opened asset re-syncs after being changed in a 3rd-party app, and ends the session on
+ *  logout/close. */
 @RestController
 @RequestMapping("/api/work-sessions")
 @PreAuthorize("isAuthenticated()")
@@ -33,9 +37,16 @@ public class WorkSessionController {
         return ResponseEntity.ok().build();
     }
 
+    /** Body: {@code { idle: boolean, elapsedSeconds: number }} — {@code idle} is whether the
+     *  client's system-wide idle clock was already past the 10-minute threshold at tick time;
+     *  {@code elapsedSeconds} is how long since the previous tick (server clamps this, see
+     *  WorkSessionService.MAX_TICK_SECONDS, so a delayed/stale tick can't over-credit time). */
     @PostMapping("/heartbeat")
-    public ResponseEntity<Void> heartbeat(@AuthenticationPrincipal User user) {
-        workSessionService.heartbeat(user);
+    public ResponseEntity<Void> heartbeat(@RequestBody(required = false) Map<String, Object> body,
+                                           @AuthenticationPrincipal User user) {
+        boolean idle = body != null && Boolean.TRUE.equals(body.get("idle"));
+        long elapsedSeconds = body != null && body.get("elapsedSeconds") instanceof Number n ? n.longValue() : 0;
+        workSessionService.heartbeat(user, idle, elapsedSeconds);
         return ResponseEntity.ok().build();
     }
 

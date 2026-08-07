@@ -37,9 +37,34 @@ public class AssetEditSessionController {
         return ResponseEntity.ok().build();
     }
 
+    /** Body: {@code { assetId, idle: boolean, elapsedSeconds: number }} — sibling to
+     *  /work-sessions/heartbeat, called on the same ~30s tick while this asset's edit session is
+     *  open, so its idle-corrected activeSeconds accumulates in step with the overall work
+     *  session. */
+    @PostMapping("/tick")
+    public ResponseEntity<Void> tick(@RequestBody Map<String, Object> body, @AuthenticationPrincipal User user) {
+        Object rawAssetId = body.get("assetId");
+        Long assetId = rawAssetId == null ? null : Long.valueOf(String.valueOf(rawAssetId));
+        boolean idle = Boolean.TRUE.equals(body.get("idle"));
+        long elapsedSeconds = body.get("elapsedSeconds") instanceof Number n ? n.longValue() : 0;
+        if (assetId != null) assetEditSessionService.tick(user, assetId, idle, elapsedSeconds);
+        return ResponseEntity.ok().build();
+    }
+
     @GetMapping("/today")
     public ResponseEntity<List<AssetEditSessionDto>> today(@AuthenticationPrincipal User user) {
         return ResponseEntity.ok(assetEditSessionService.getToday(user));
+    }
+
+    /** Self-scoped "my sessions in this date range" — backs the dashboard's This Week/This Month
+     *  tabs. Any authenticated user can see their own history here; contrast with
+     *  TimeReportController, which spans every user and is restricted to billing roles. */
+    @GetMapping("/range")
+    public ResponseEntity<List<AssetEditSessionDto>> range(
+            @RequestParam("from") @org.springframework.format.annotation.DateTimeFormat(iso = org.springframework.format.annotation.DateTimeFormat.ISO.DATE) java.time.LocalDate from,
+            @RequestParam("to") @org.springframework.format.annotation.DateTimeFormat(iso = org.springframework.format.annotation.DateTimeFormat.ISO.DATE) java.time.LocalDate to,
+            @AuthenticationPrincipal User user) {
+        return ResponseEntity.ok(assetEditSessionService.getRange(user, from, to));
     }
 
     /**

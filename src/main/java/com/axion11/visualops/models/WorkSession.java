@@ -40,10 +40,20 @@ public class WorkSession {
     @Column(nullable = false)
     private Integer assetsEditedCount = 0;
 
+    /** Idle-corrected active seconds, accumulated one heartbeat tick at a time (see
+     *  WorkSessionService#heartbeat) — only ticks where the client reported real system input
+     *  within the idle threshold get added. This is what the dashboard's "Active Editing Time"
+     *  is actually derived from now, instead of the raw login-to-logout wall-clock span, which
+     *  couldn't tell "working" apart from "stepped away with the app still open". */
+    @Builder.Default
+    @Column(nullable = false)
+    private Long activeSeconds = 0L;
+
     @PrePersist
     protected void onCreate() {
         if (loginTime == null) loginTime = LocalDateTime.now();
         if (lastHeartbeatAt == null) lastHeartbeatAt = loginTime;
         if (assetsEditedCount == null) assetsEditedCount = 0;
+        if (activeSeconds == null) activeSeconds = 0L;
     }
 }

@@ -8,7 +8,6 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.time.Duration;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.List;
@@ -16,6 +15,12 @@ import java.util.List;
 @Service
 @RequiredArgsConstructor
 public class WorkSessionService {
+
+    /** A tick's elapsed-seconds value is client-reported (see useWorkSessionTracking's 30s
+     *  activity tick) — clamp what actually gets added server-side so a suspended/sleeping
+     *  laptop waking up and sending one delayed tick can't retroactively credit hours of
+     *  "active" time it never actually observed input for. */
+    private static final long MAX_TICK_SECONDS = 90;
 
     private final WorkSessionRepository workSessionRepository;
     private final AssetEditSessionService assetEditSessionService;
@@ -49,11 +54,21 @@ public class WorkSessionService {
         assetEditSessionService.closeDangling(user, "SESSION_END");
     }
 
+    /** Called every activity tick (~30s) while the app is open. {@code idle} reflects whether the
+     *  client observed system-wide input (mouse/keyboard, anywhere — not just inside this app's
+     *  own window, since the user's real activity is usually happening in a 3rd-party editor)
+     *  within the idle threshold since the last tick. Only non-idle ticks extend
+     *  {@code activeSeconds}; idle ticks still refresh {@code lastHeartbeatAt} so crash/stale-
+     *  session recovery keeps working, they just don't count toward active time. */
     @Transactional
-    public void heartbeat(User user) {
+    public void heartbeat(User user, boolean idle, long elapsedSeconds) {
         workSessionRepository.findFirstByUserIdAndLogoutTimeIsNullOrderByLoginTimeDesc(user.getId())
                 .ifPresent(session -> {
                     session.setLastHeartbeatAt(LocalDateTime.now());
+                    if (!idle) {
+                        long clamped = Math.max(0, Math.min(elapsedSeconds, MAX_TICK_SECONDS));
+                        session.setActiveSeconds(session.getActiveSeconds() + clamped);
+                    }
                     workSessionRepository.save(session);
                 });
     }
@@ -78,7 +93,22 @@ public class WorkSessionService {
                 .assetsEditedToday(totalAssetsEdited(user, today))
                 .activeSecondsYesterday(totalActiveSeconds(user, yesterday))
                 .assetsEditedYesterday(totalAssetsEdited(user, yesterday))
+                .activeSecondsAllTime(workSessionRepository.sumActiveSecondsByUserId(user.getId()))
                 .build();
+    }
+
+    /** Per-day active-time breakdown for a user across an arbitrary range — backs the weekly/
+     *  monthly reports. Grouped by calendar day of {@code loginTime} rather than by individual
+     *  session, since a person can log in/out multiple times a day and the report should show
+     *  one row per day. */
+    @Transactional(readOnly = true)
+    public java.util.Map<LocalDate, Long> activeSecondsByDay(User user, LocalDate from, LocalDate to) {
+        LocalDateTime start = from.atStartOfDay();
+        LocalDateTime end = to.plusDays(1).atStartOfDay();
+        return workSessionRepository.findByUserIdAndLoginTimeBetween(user.getId(), start, end).stream()
+                .collect(java.util.stream.Collectors.groupingBy(
+                        s -> s.getLoginTime().toLocalDate(),
+                        java.util.stream.Collectors.summingLong(WorkSession::getActiveSeconds)));
     }
 
     private List<WorkSession> sessionsOn(User user, LocalDate day) {
@@ -88,12 +118,7 @@ public class WorkSessionService {
     }
 
     private long totalActiveSeconds(User user, LocalDate day) {
-        return sessionsOn(user, day).stream()
-                .mapToLong(session -> {
-                    LocalDateTime end = session.getLogoutTime() != null ? session.getLogoutTime() : session.getLastHeartbeatAt();
-                    return Math.max(Duration.between(session.getLoginTime(), end).getSeconds(), 0);
-                })
-                .sum();
+        return sessionsOn(user, day).stream().mapToLong(WorkSession::getActiveSeconds).sum();
     }
 
     private int totalAssetsEdited(User user, LocalDate day) {
