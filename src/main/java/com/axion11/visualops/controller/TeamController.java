@@ -93,6 +93,10 @@ public class TeamController {
         String adminContact = body.get("adminContact");
         String adminCountry = body.get("adminCountry");
 
+        if (teamRepository.existsByTeamName(teamName)) {
+            return ResponseEntity.status(409).body(Map.of("error", "A team named \"" + teamName + "\" already exists"));
+        }
+
         User admin = userRepository.findByEmail(adminEmail).orElse(null);
         if (admin == null) {
             admin = User.builder()
