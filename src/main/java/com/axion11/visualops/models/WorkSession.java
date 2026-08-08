@@ -42,12 +42,21 @@ public class WorkSession {
 
     /** Idle-corrected active seconds, accumulated one heartbeat tick at a time (see
      *  WorkSessionService#heartbeat) — only ticks where the client reported real system input
-     *  within the idle threshold get added. This is what the dashboard's "Active Editing Time"
-     *  is actually derived from now, instead of the raw login-to-logout wall-clock span, which
-     *  couldn't tell "working" apart from "stepped away with the app still open". */
+     *  within the (10-minute) idle threshold get added. This is what the dashboard's "Active
+     *  Editing Time" is derived from — a generous threshold that tolerates longer thinking/
+     *  waiting pauses during actual creative work. */
     @Builder.Default
     @Column(nullable = false)
     private Long activeSeconds = 0L;
+
+    /** Same idea as activeSeconds but gated by a much shorter (3-minute) idle threshold — "was
+     *  the user at their desk at all", not "were they still mid-task". Backs the dashboard's
+     *  "Time In App" figure, which is deliberately stricter than Active Editing Time: a 4-minute
+     *  gap with no input counts as still-active editing (under the 10-minute bar) but already
+     *  excluded from Time In App (over the 3-minute bar). */
+    @Builder.Default
+    @Column(nullable = false)
+    private Long timeInAppSeconds = 0L;
 
     @PrePersist
     protected void onCreate() {
@@ -55,5 +64,6 @@ public class WorkSession {
         if (lastHeartbeatAt == null) lastHeartbeatAt = loginTime;
         if (assetsEditedCount == null) assetsEditedCount = 0;
         if (activeSeconds == null) activeSeconds = 0L;
+        if (timeInAppSeconds == null) timeInAppSeconds = 0L;
     }
 }

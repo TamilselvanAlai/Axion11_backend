@@ -18,8 +18,9 @@ public interface WorkSessionRepository extends JpaRepository<WorkSession, Long> 
 
     List<WorkSession> findByUserIdAndLoginTimeBetween(Long userId, LocalDateTime start, LocalDateTime end);
 
-    List<WorkSession> findByLoginTimeBetween(LocalDateTime start, LocalDateTime end);
-
     @Query("SELECT COALESCE(SUM(s.activeSeconds), 0) FROM WorkSession s WHERE s.user.id = :userId")
     long sumActiveSecondsByUserId(@Param("userId") Long userId);
+
+    @Query("SELECT COALESCE(SUM(s.timeInAppSeconds), 0) FROM WorkSession s WHERE s.user.id = :userId")
+    long sumTimeInAppSecondsByUserId(@Param("userId") Long userId);
 }

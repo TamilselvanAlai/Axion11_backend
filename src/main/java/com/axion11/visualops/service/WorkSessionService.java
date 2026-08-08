@@ -2,6 +2,7 @@ package com.axion11.visualops.service;
 
 import com.axion11.visualops.models.User;
 import com.axion11.visualops.models.WorkSession;
+import com.axion11.visualops.models.dto.WorkSessionRangeSummaryDto;
 import com.axion11.visualops.models.dto.WorkSessionSummaryDto;
 import com.axion11.visualops.repository.WorkSessionRepository;
 import lombok.RequiredArgsConstructor;
@@ -68,20 +69,27 @@ public class WorkSessionService {
         assetEditSessionService.closeDangling(user, "SESSION_END");
     }
 
-    /** Called every activity tick (~30s) while the app is open. {@code idle} reflects whether the
-     *  client observed system-wide input (mouse/keyboard, anywhere — not just inside this app's
-     *  own window, since the user's real activity is usually happening in a 3rd-party editor)
-     *  within the idle threshold since the last tick. Only non-idle ticks extend
-     *  {@code activeSeconds}; idle ticks still refresh {@code lastHeartbeatAt} so crash/stale-
-     *  session recovery keeps working, they just don't count toward active time. */
+    /** Called every activity tick (~30s) while the app is open. Both flags come from the same
+     *  client-side idle streak (see useWorkSessionTracking) — how long since real system-wide
+     *  input was last observed — just measured against two different bars: {@code idle} is the
+     *  10-minute bar backing activeSeconds (generous — tolerates longer pauses mid-task);
+     *  {@code idleForApp} is the 3-minute bar backing timeInAppSeconds (stricter — "were they at
+     *  their desk at all"). idleForApp therefore flips true first on any sustained gap, so
+     *  timeInAppSeconds can be *less* than activeSeconds for the same stretch — that's expected,
+     *  not a bug: a 4-minute silent gap still counts as "still working" but not "still present".
+     *  Both flags still refresh lastHeartbeatAt regardless, so crash/stale-session recovery keeps
+     *  working even through a fully idle stretch. */
     @Transactional
-    public void heartbeat(User user, boolean idle, long elapsedSeconds) {
+    public void heartbeat(User user, boolean idle, boolean idleForApp, long elapsedSeconds) {
         workSessionRepository.findFirstByUserIdAndLogoutTimeIsNullOrderByLoginTimeDesc(user.getId())
                 .ifPresent(session -> {
                     session.setLastHeartbeatAt(LocalDateTime.now());
+                    long clamped = Math.max(0, Math.min(elapsedSeconds, MAX_TICK_SECONDS));
                     if (!idle) {
-                        long clamped = Math.max(0, Math.min(elapsedSeconds, MAX_TICK_SECONDS));
                         session.setActiveSeconds(session.getActiveSeconds() + clamped);
+                    }
+                    if (!idleForApp) {
+                        session.setTimeInAppSeconds(session.getTimeInAppSeconds() + clamped);
                     }
                     workSessionRepository.save(session);
                 });
@@ -108,21 +116,24 @@ public class WorkSessionService {
                 .activeSecondsYesterday(totalActiveSeconds(user, yesterday))
                 .assetsEditedYesterday(totalAssetsEdited(user, yesterday))
                 .activeSecondsAllTime(workSessionRepository.sumActiveSecondsByUserId(user.getId()))
+                .timeInAppSecondsToday(totalTimeInAppSeconds(user, today))
+                .timeInAppSecondsAllTime(workSessionRepository.sumTimeInAppSecondsByUserId(user.getId()))
                 .build();
     }
 
-    /** Per-day active-time breakdown for a user across an arbitrary range — backs the weekly/
-     *  monthly reports. Grouped by calendar day of {@code loginTime} rather than by individual
-     *  session, since a person can log in/out multiple times a day and the report should show
-     *  one row per day. */
+    /** Self-scoped Active Editing Time / Time In App / assets-edited totals for an arbitrary
+     *  inclusive date range — backs the Time Management card's Week/Month tabs (mirrors
+     *  AssetEditSessionService#getRange for the Assets Edited card). */
     @Transactional(readOnly = true)
-    public java.util.Map<LocalDate, Long> activeSecondsByDay(User user, LocalDate from, LocalDate to) {
+    public WorkSessionRangeSummaryDto getRangeSummary(User user, LocalDate from, LocalDate to) {
         LocalDateTime start = from.atStartOfDay();
         LocalDateTime end = to.plusDays(1).atStartOfDay();
-        return workSessionRepository.findByUserIdAndLoginTimeBetween(user.getId(), start, end).stream()
-                .collect(java.util.stream.Collectors.groupingBy(
-                        s -> s.getLoginTime().toLocalDate(),
-                        java.util.stream.Collectors.summingLong(WorkSession::getActiveSeconds)));
+        List<WorkSession> sessions = workSessionRepository.findByUserIdAndLoginTimeBetween(user.getId(), start, end);
+        return WorkSessionRangeSummaryDto.builder()
+                .activeSeconds(sessions.stream().mapToLong(WorkSession::getActiveSeconds).sum())
+                .timeInAppSeconds(sessions.stream().mapToLong(WorkSession::getTimeInAppSeconds).sum())
+                .assetsEditedCount(sessions.stream().mapToInt(WorkSession::getAssetsEditedCount).sum())
+                .build();
     }
 
     private List<WorkSession> sessionsOn(User user, LocalDate day) {
@@ -137,5 +148,9 @@ public class WorkSessionService {
 
     private int totalAssetsEdited(User user, LocalDate day) {
         return sessionsOn(user, day).stream().mapToInt(WorkSession::getAssetsEditedCount).sum();
+    }
+
+    private long totalTimeInAppSeconds(User user, LocalDate day) {
+        return sessionsOn(user, day).stream().mapToLong(WorkSession::getTimeInAppSeconds).sum();
     }
 }
