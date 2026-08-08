@@ -29,10 +29,24 @@ public class WorkSessionService {
     public WorkSession startSession(User user) {
         // Recover from a prior session that never got an explicit logout (crash / force quit) —
         // close it using its last heartbeat instead of letting it "leak" open forever.
-        workSessionRepository.findByUserIdAndLogoutTimeIsNull(user.getId()).forEach(stale -> {
+        boolean recoveredStaleSession = false;
+        List<WorkSession> danglingSessions = workSessionRepository.findByUserIdAndLogoutTimeIsNull(user.getId());
+        for (WorkSession stale : danglingSessions) {
             stale.setLogoutTime(stale.getLastHeartbeatAt());
             workSessionRepository.save(stale);
-        });
+            recoveredStaleSession = true;
+        }
+        // A crash/force-quit leaves the asset edit session that was open at the time dangling too
+        // (endedAt still null) — and getTotalProductionSeconds only sums *closed* sessions, so
+        // its already-accumulated activeSeconds sits invisible in Production Time until this
+        // closes. Worse, re-opening that same asset later is a no-op in
+        // AssetEditSessionService#startSession ("already open for this asset"), so without this
+        // it would silently keep ticking into the same never-closing row forever instead of ever
+        // being counted. Only worth doing when a WorkSession actually needed recovering — a clean
+        // login has nothing dangling to close.
+        if (recoveredStaleSession) {
+            assetEditSessionService.closeDangling(user, "SESSION_END");
+        }
 
         LocalDateTime now = LocalDateTime.now();
         WorkSession session = WorkSession.builder()

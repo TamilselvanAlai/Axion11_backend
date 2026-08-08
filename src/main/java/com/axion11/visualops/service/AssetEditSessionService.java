@@ -88,8 +88,7 @@ public class AssetEditSessionService {
     }
 
     /** Same shape as {@link #getToday} but for an arbitrary inclusive date range — backs the
-     *  dashboard's "This Week"/"This Month" tabs on the Assets Edited card (self-scoped, unlike
-     *  the admin-only payroll report in {@link #getReport}, which spans every user). */
+     *  dashboard's "This Week"/"This Month" tabs on the Assets Edited card. */
     @Transactional(readOnly = true)
     public List<AssetEditSessionDto> getRange(User user, LocalDate from, LocalDate to) {
         LocalDateTime start = from.atStartOfDay();
@@ -169,77 +168,4 @@ public class AssetEditSessionService {
         return Math.max(wallClock - s.getActiveSeconds(), 0);
     }
 
-    /** Per-asset-session detail rows for the weekly/monthly payroll report — every closed edit
-     *  session with a start date in range, optionally narrowed to one user. Powers the "which
-     *  asset, how long, who" breakdown; {@link #getPayrollRollup} sums this same data up to a
-     *  per-user/per-project total for the pay calculation. */
-    @Transactional(readOnly = true)
-    public List<com.axion11.visualops.models.dto.AssetEditReportRowDto> getReport(LocalDate from, LocalDate to, Long userId) {
-        LocalDateTime start = from.atStartOfDay();
-        LocalDateTime end = to.plusDays(1).atStartOfDay();
-        return assetEditSessionRepository.findByStartedAtBetweenAndEndedAtIsNotNull(start, end).stream()
-                .filter(s -> userId == null || s.getUser().getId().equals(userId))
-                .sorted(java.util.Comparator.comparing(AssetEditSession::getStartedAt).reversed())
-                .map(this::toReportRow)
-                .collect(Collectors.toList());
-    }
-
-    /** Sums {@link #getReport} down to one row per (user, project) — the actual payroll input:
-     *  active hours logged against a project, multiplied by that project's hourly rate. A user
-     *  who worked across several projects in the period gets one row per project rather than a
-     *  single blended rate, since rates are set per project ({@link Project#getPricePerHour}),
-     *  not per user. */
-    @Transactional(readOnly = true)
-    public List<com.axion11.visualops.models.dto.PayrollRowDto> getPayrollRollup(LocalDate from, LocalDate to, Long userId) {
-        LocalDateTime start = from.atStartOfDay();
-        LocalDateTime end = to.plusDays(1).atStartOfDay();
-        List<AssetEditSession> sessions = assetEditSessionRepository.findByStartedAtBetweenAndEndedAtIsNotNull(start, end).stream()
-                .filter(s -> userId == null || s.getUser().getId().equals(userId))
-                .filter(s -> s.getImageUpload().getProject() != null)
-                .collect(Collectors.toList());
-
-        record Key(Long userId, Long projectId) {}
-        java.util.Map<Key, List<AssetEditSession>> grouped = sessions.stream()
-                .collect(Collectors.groupingBy(s -> new Key(s.getUser().getId(), s.getImageUpload().getProject().getId())));
-
-        return grouped.entrySet().stream()
-                .map(e -> {
-                    List<AssetEditSession> group = e.getValue();
-                    User user = group.get(0).getUser();
-                    com.axion11.visualops.models.Project project = group.get(0).getImageUpload().getProject();
-                    long activeSeconds = group.stream().mapToLong(AssetEditSession::getActiveSeconds).sum();
-                    java.math.BigDecimal rate = project.getPricePerHour() != null ? project.getPricePerHour() : java.math.BigDecimal.ZERO;
-                    java.math.BigDecimal hours = java.math.BigDecimal.valueOf(activeSeconds)
-                            .divide(java.math.BigDecimal.valueOf(3600), 4, java.math.RoundingMode.HALF_UP);
-                    return com.axion11.visualops.models.dto.PayrollRowDto.builder()
-                            .userId(user.getId())
-                            .userName(user.getName())
-                            .projectId(project.getId())
-                            .projectName(project.getName())
-                            .activeSeconds(activeSeconds)
-                            .ratePerHour(rate)
-                            .estimatedPay(hours.multiply(rate).setScale(2, java.math.RoundingMode.HALF_UP))
-                            .build();
-                })
-                .sorted(java.util.Comparator.comparing(com.axion11.visualops.models.dto.PayrollRowDto::getUserName))
-                .collect(Collectors.toList());
-    }
-
-    private com.axion11.visualops.models.dto.AssetEditReportRowDto toReportRow(AssetEditSession s) {
-        ImageUpload upload = s.getImageUpload();
-        com.axion11.visualops.models.Project project = upload.getProject();
-        return com.axion11.visualops.models.dto.AssetEditReportRowDto.builder()
-                .userId(s.getUser().getId())
-                .userName(s.getUser().getName())
-                .assetId(upload.getId())
-                .fileName(upload.getFileName())
-                .projectId(project != null ? project.getId() : null)
-                .projectName(project != null ? project.getName() : null)
-                .startedAt(s.getStartedAt())
-                .endedAt(s.getEndedAt())
-                .activeSeconds(s.getActiveSeconds())
-                .idleSecondsExcluded(idleSecondsExcluded(s))
-                .endReason(s.getEndReason())
-                .build();
-    }
 }
